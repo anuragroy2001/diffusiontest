@@ -46,6 +46,9 @@ MAX_PENDING   = int(os.environ.get("LOOM_MAX_PENDING", "60"))    # queue cap; be
 MAX_PER_PERSON = 3                                               # pending phrases one contributor may hold
 MAX_PHRASE    = 120                                              # characters
 MAX_EDIT      = 2000     # characters an /edit replacement may hold — a paragraph, not a chapter
+MAX_TRIES     = int(os.environ.get("LOOM_MAX_TRIES", "3"))
+                         # weave rounds a phrase may fail before it lands verbatim instead. The weave is
+                         # the preferred route; inclusion by construction is the floor under it.
 SPLIT_AT      = 185      # tokens the live paragraph is trimmed back to, leaving ~70 canvas positions of
                          # gap. Keeping it NEAR the canvas size is what stops the story running away:
                          # a small live paragraph means enormous gaps, and the model fills enormous gaps
@@ -96,6 +99,17 @@ def _bootstrap_prose(raw: str) -> str:
     return tail[:end + 1].strip() if end >= 0 else ""
 
 
+def _sentence_at(text: str, pos: int) -> int:
+    """Index of the sentence containing character position `pos`."""
+    at = 0
+    sents = split_sentences(text)
+    for i, s in enumerate(sents):
+        at += len(s)
+        if pos < at:
+            return i
+    return max(0, len(sents) - 1)
+
+
 # --------------------------------------------------------------------------------------------------
 # state
 # --------------------------------------------------------------------------------------------------
@@ -117,6 +131,7 @@ class Pending:
     at: float
     target_id: int | None = None  # paragraph id; None means whichever is live when the round runs
     after: int | None = None      # sentence index within that paragraph to insert behind; None spreads
+    tries: int = 0                # weave rounds this phrase has failed; at MAX_TRIES it lands verbatim
 
     def as_json(self) -> dict:
         return {"text": self.text, "contributor": self.contributor, "at": self.at,
@@ -210,6 +225,10 @@ class Loom:
         self.absorbed: set[str] = set()
         self.round = 0
         self.ripple: deque[int] = deque()        # paragraphs waiting to absorb a change made before them
+        # Paragraph index -> sentence index of a fresh verbatim insert. Read once by the next ripple on
+        # that paragraph, which dissolves the seam's neighbours so the model blends around the insert
+        # instead of rewriting an arbitrary sentence.
+        self.smooth: dict[int, int] = {}
         self.busy = False
         # True once the first round has ever committed. Generating into a still-empty canvas (nobody
         # has submitted yet) makes the model write a planning outline instead of prose, so the worker
@@ -281,15 +300,18 @@ class Loom:
         return out
 
     def edit(self, target_id: int, text: str, contributor: Contributor) -> dict:
-        """A wholesale rewrite of one paragraph, from the projector's edit-in-place. `/submit` can only
-        insert (the model weaves a phrase around protected text), so deletions and rewrites arrive here
-        instead: the operator's text becomes the paragraph verbatim — no model round, nothing to mangle
-        the words they deliberately typed — and the ripple cascade re-absorbs the change downstream.
+        """The projector's edit-in-place: every operator edit lands verbatim, immediately. What happens
+        next depends on what the edit was, diffed server-side against the committed text:
 
-        A phrase the rewrite removed stops being re-pinned on its own: protection is presence-filtered
-        against the paragraph's current text every round, so no `absorbed` bookkeeping is needed. The
-        edited paragraph itself is deliberately NOT rippled — the operator just wrote exactly what they
-        want it to say."""
+        - A pure insertion is treated like a submission that skipped the queue — the inserted run joins
+          `absorbed` so every future round pins it, and the paragraph itself is queued for a smoothing
+          ripple that re-denoises the sentences around the seam. Inclusion by construction, spectacle
+          afterwards; a rejected smoothing ripple just leaves the verbatim text standing.
+        - A rewrite or deletion stays untouched by the model: the operator wrote exactly what they want
+          the line to say, so only the downstream cascade runs.
+
+        A phrase a rewrite removed stops being re-pinned on its own: protection is presence-filtered
+        against the paragraph's current text every round, so no `absorbed` cleanup is needed."""
         text = re.sub(r"\s+", " ", text).strip()[:MAX_EDIT]
         if not text:
             raise ValueError("an empty paragraph would tear the story — the whole line must remain")
@@ -302,12 +324,29 @@ class Loom:
             before = self.paragraphs[idx]
             if text == before:
                 return {"edited": False, "block": idx}
+
+            # Longest common prefix/suffix -> the one contiguous run that changed.
+            a, lim = 0, min(len(before), len(text))
+            while a < lim and before[a] == text[a]:
+                a += 1
+            b = 0
+            while b < lim - a and before[len(before) - 1 - b] == text[len(text) - 1 - b]:
+                b += 1
+            inserted = text[a:len(text) - b].strip()
+            removed = before[a:len(before) - b].strip()
+            pure_insert = bool(inserted) and not removed
+
             self.round += 1
             n = self.round
             self.paragraphs[idx] = text
             self.history.append(Revision(n=n, at=time.time(), block=idx, before=before, after=text,
                                          seed=0, kind="edit", retro=idx != self.live,
                                          submissions=[{"text": text, "contributor": contributor.id}]))
+            if pure_insert:
+                self.absorbed.add(inserted)
+                self.smooth[idx] = _sentence_at(text, a)
+                if idx not in self.ripple:
+                    self.ripple.appendleft(idx)   # blend the seam before the downstream cascade
             for i in range(idx + 1, len(self.paragraphs)):
                 if i not in self.ripple:
                     self.ripple.append(i)
@@ -317,7 +356,38 @@ class Loom:
         self.bus.publish({"type": "edit", "round": n, "block": block, "text": text})
         self._maybe_illustrate(block, n, text)
         self.last_round = time.time()
-        return {"edited": True, "block": block}
+        return {"edited": True, "block": block, "smoothing": pure_insert}
+
+    def _splice(self, p: Pending) -> None:
+        """A phrase that failed MAX_TRIES weave rounds lands verbatim instead — the same inclusion-by-
+        construction _bootstrap uses, because with one phone in the room every phrase is precious and
+        'the loom quietly gave up' is the one outcome the contributor cannot see. Spliced in after its
+        anchor sentence (or at the end without one), protected, and queued for a smoothing ripple."""
+        with self.lock:
+            idx = self._pid_index.get(p.target_id, self.live) if p.target_id is not None else self.live
+            before = self.paragraphs[idx]
+            sents = split_sentences(before)
+            at = len(sents) - 1 if p.after is None else max(-1, min(p.after, len(sents) - 1))
+            head = "".join(sents[:at + 1]).rstrip()
+            tail = "".join(sents[at + 1:]).lstrip()
+            text = " ".join(part for part in (head, p.text, tail) if part)
+            self.round += 1
+            n = self.round
+            self.paragraphs[idx] = text
+            self.absorbed.add(p.text)
+            self.smooth[idx] = _sentence_at(text, len(head) + 1 if head else 0)
+            if idx not in self.ripple:
+                self.ripple.appendleft(idx)
+            for i in range(idx + 1, len(self.paragraphs)):
+                if i not in self.ripple:
+                    self.ripple.append(i)
+            self.history.append(Revision(n=n, at=time.time(), block=idx, before=before, after=text,
+                                         seed=0, kind="splice", retro=idx != self.live,
+                                         submissions=[{"text": p.text, "contributor": p.contributor}]))
+        # Same event shape as an operator edit: the paragraph changed outside a streaming round.
+        self.bus.publish({"type": "edit", "round": n, "block": idx, "text": text})
+        self._maybe_illustrate(idx, n, text)
+        self.last_round = time.time()
 
     def pending_json(self) -> list[dict]:
         with self.lock:
@@ -502,12 +572,20 @@ class Loom:
         subs = [Submission(text=p.text, id=p.contributor, after=p.after) for p in batch]
         protect = tuple(t for t in self.absorbed if t in before)  # nobody's phrase gets deleted
         # A ripple round has nothing new to weave, so it would reproduce the paragraph verbatim -- give
-        # it a sentence to rewrite instead. Chosen from the round number rather than at random: the
-        # revision log has to replay exactly for the time-lapse at the end.
+        # it a sentence to rewrite instead. A fresh verbatim insert leaves a seam hint, and the ripple
+        # dissolves the seam's neighbours so the blending happens where the operator just typed --
+        # plan_weave refuses to dissolve the protected sentence itself. Otherwise the sentence comes
+        # from the round number rather than at random: the revision log has to replay exactly for the
+        # time-lapse at the end.
         dissolve: tuple[int, ...] = ()
         if not subs:
             n_sents = len(split_sentences(before))
-            if n_sents > 1:
+            with self.lock:
+                hint = self.smooth.pop(target, None)
+            if hint is not None and n_sents > 1:
+                dissolve = tuple(i for i in (hint - 1, hint + 1) if 0 <= i < n_sents) \
+                           or (n % n_sents,)
+            elif n_sents > 1:
                 dissolve = (n % n_sents,)
         plan = plan_weave(before, subs, self.tok, Policy(), protect=protect, dissolve=dissolve)
         seed = 1000 + n
@@ -531,12 +609,18 @@ class Loom:
             raise
         after = tidy(raw)
 
-        reason = self._accept(after, plan, target, before)
+        reason = self._accept(after, plan, target, before, protect)
         if reason:
-            # Keep what the room already liked, and put the phrases back at the front of the queue: the
-            # next round runs in about six seconds, so a rejected round costs almost nothing.
-            self._requeue(batch)
+            # Keep what the room already liked. Phrases that still have weave attempts left go back to
+            # the front of the queue (the next round runs in about six seconds); a phrase that has now
+            # burned MAX_TRIES rounds stops gambling on the model and lands verbatim via _splice.
+            for p in batch:
+                p.tries += 1
+            self._requeue([p for p in batch if p.tries < MAX_TRIES])
             self.bus.publish({"type": "round_rejected", "round": n, "block": target, "reason": reason})
+            for p in batch:
+                if p.tries >= MAX_TRIES:
+                    self._splice(p)
             self.last_round = time.time()
             return
 
@@ -576,8 +660,24 @@ class Loom:
         self.last_round = time.time()
         self.bus.publish({"type": "round_end", "round": n, "state": self.state()})
 
-    def _accept(self, text: str, plan, target: int, before: str) -> str | None:
+    def _accept(self, text: str, plan, target: int, before: str,
+                protect: tuple[str, ...] = ()) -> str | None:
         """Reason to throw this round away, or None to commit it."""
+        # The round exists to weave these in; a commit without them silently eats someone's words.
+        # tidy() is the usual culprit -- a phrase pinned near the end of the canvas sits right where
+        # the model dumps meta-commentary and the trim amputates.
+        subs = [p.text.strip() for p in plan.pins if p.role == "submission" and p.text.strip()]
+        missing = [s for s in subs if s not in text]
+        if missing:
+            return f"the phrase {missing[0][:40]!r} didn't survive"
+        # Absorbed phrases that entered the round must leave it too. The pins guarantee they're in the
+        # RAW output, but tidy() can trim them (a ripple pins them as ordinary story spans, and the
+        # ACCEPT_RATIO check tolerates losing a few of those) -- so a phrase-level check, not a ratio:
+        # this is the one failure the whole exhibit cannot afford. A rejected ripple costs nothing;
+        # the verbatim text it would have smoothed simply stands.
+        lost = [t for t in protect if t not in text]
+        if lost:
+            return f"a protected phrase {lost[0][:40]!r} didn't survive"
         story = [p.text.strip() for p in plan.pins if p.role == "story" and p.text.strip()]
         if story:
             # A canvas that trimmed early, or a model that wandered, can drop pinned spans. Committing

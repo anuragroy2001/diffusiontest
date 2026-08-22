@@ -368,23 +368,13 @@ function renderStory(){
    The projector is the shared, one-and-only screen the whole room watches, so an edit made here
    is a deliberate operator action, not a per-contributor submission -- it gets its own persisted
    identity (distinct from any phone's), separate from the crowd's live phrases.
-   On enter the line is diffed against its committed text and routed by what the edit actually is:
-   a pure insertion becomes a phrase for /submit, so the loom visibly weaves it in with placement
-   taken from where it was typed; anything that removed or reworded existing words goes to /edit
-   wholesale, landing verbatim with the ripple cascade re-absorbing it downstream. */
+   Every edit goes to /edit and lands verbatim the moment enter is hit -- one gesture, one
+   behaviour. The server diffs it against the committed text itself: a pure insertion gets
+   protected and followed by a smoothing ripple that blends the seam (the model reworks the
+   paragraph AROUND the typed words, never instead of them); a rewrite stands as typed with only
+   the downstream cascade re-absorbing it. */
 let editEl = null, editOrig = '', editTargetId = null;
 let opId = localStorage.getItem('loom_operator_id') || null;
-
-// Mirrors loom/weave.py's split_sentences -- a placement hint, not authoritative; the server
-// independently re-derives and bounds-checks `after` against its own split at submit time.
-function splitSentences(text){
-  const out = [];
-  const end = /[.!?]+["”'\)\]]*\s+/g;
-  let start = 0, m;
-  while ((m = end.exec(text))){ out.push(text.slice(start, m.index + m[0].length)); start = end.lastIndex; }
-  if (text.slice(start).trim()) out.push(text.slice(start));
-  return out;
-}
 
 function startEdit(p, i){
   if(editEl) cancelEdit();
@@ -444,37 +434,13 @@ async function commitEdit(){
   cancelEdit();   // the screen goes back to the committed text; the loom brings the change
   if(!edited){ toast('an empty line would tear the story — esc lets go instead', 3400); return; }
   if(edited === orig) return;
-  // longest common prefix/suffix -> the one contiguous run that changed
-  let a = 0;
-  const lim = Math.min(orig.length, edited.length);
-  while(a < lim && orig[a] === edited[a]) a++;
-  let b = 0;
-  while(b < lim - a && orig[orig.length - 1 - b] === edited[edited.length - 1 - b]) b++;
-  const inserted = edited.slice(a, edited.length - b).trim();
-  const removed = orig.slice(a, orig.length - b).trim();
-
-  if(removed){
-    // a rewrite or deletion: the typed words become the paragraph verbatim via /edit, and the
-    // ripple cascade re-absorbs the change downstream -- no model round to mangle them
-    const r = await sendLoom('/edit', {text: edited, target_id: targetId});
-    toast(r.ok ? 'rewrote the line — the story is re-absorbing it' : sendFail(r), 3400);
-    return;
-  }
-
-  if(!inserted) return;
-  // a pure insertion still goes through /submit, so the loom visibly weaves it in
-  let after = null, at = 0;
-  splitSentences(orig).forEach((s, i) => { at += s.length; if(at <= a) after = i; });
-  const payload = { text: inserted, target_id: targetId };
-  if(after !== null) payload.after = after;
-  const r = await sendLoom('/submit', payload);
-  if(r.ok){
-    toast(r.j.target_applied === false
-      ? (r.j.target_reason || 'that line changed before it landed') + ' — joined the live line instead'
-      : 'weaving it into that line', 3000);
-  } else {
-    toast(sendFail(r), 3400);
-  }
+  // one path for every edit: it lands verbatim now, and the server decides what the loom does next
+  const r = await sendLoom('/edit', {text: edited, target_id: targetId});
+  if(!r.ok){ toast(sendFail(r), 3400); return; }
+  if(r.j.edited === false) return;   // normalised to the same text -- nothing changed
+  toast(r.j.smoothing
+    ? 'added — the loom is blending it in'
+    : 'rewrote the line — the story is re-absorbing it', 3000);
 }
 
 // delegated, not bound per-paragraph -- renderStory() rebuilds #story's children on every commit.
