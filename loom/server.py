@@ -4,35 +4,14 @@ A story is projected on a screen. Anyone scans a QR code and throws in a phrase;
 into the diffusion canvas as frozen tokens and the paragraph visibly re-denoises around it. The story
 never restarts and never breaks — it absorbs.
 
-This process owns the story and drives the rounds. It does NOT own the model: it talks to the
-DiffusionGemma shim over HTTP (docs/backend.md) and relays the denoising frames straight through to
-whatever is on the projector.
+Endpoints: 
+    POST /submit: Queue a phrase, get a contributor colour
+    GET  /state: The whole story, queue, contributors
+    GET  /stream: SSE: rounds, canvas frames, commits
+    GET  /history: The revision log, for the time-lapse close
+    GET  /health: Health check
 
-Three constraints shape the design, and all three are measured rather than assumed:
-
-  One request at a time.   The model backend is single-threaded, so a room of forty phones must never
-                           mean forty generations. Submissions land in a queue and a round drains a
-                           capped batch of them. The queue depth is worth showing — "7 phrases waiting"
-                           reads as theatre, not as a limitation.
-
-  One or two per round.    Three submissions in one canvas measurably degrades the prose (the model
-                           strains to make every pin grammatical). A round is ~6 s, so the rest wait.
-
-  Never an empty canvas.   Generating into a blank canvas makes the model write a planning outline, and
-                           no prompt stops it. Every round pins the existing paragraph back into the
-                           canvas with gaps, so there is no room for one. When a paragraph gets too long
-                           to weave, its tail seeds the next paragraph — a new paragraph never starts
-                           empty.
-
-Endpoints (all CORS-open, SSE for the projector):
-
-    POST /submit     {"text": str, "name": str?}  -> queue a phrase, get a contributor colour
-    GET  /state                                    -> the whole story, queue, contributors
-    GET  /stream                                   -> SSE: rounds, canvas frames, commits
-    GET  /history                                  -> the revision log, for the time-lapse close
-    GET  /health
-
-Run:  python3 loom/server.py        (binds the Tailscale IP only, same policy as run-server.sh)
+Run:  python3 loom/server.py
 """
 
 from __future__ import annotations
