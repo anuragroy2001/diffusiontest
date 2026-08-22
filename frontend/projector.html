@@ -210,12 +210,25 @@
      thread reads as running out from behind its own bubble.
      pathLength=1 normalises every path to one unit, so a single dash keyframe fits any length. */
   #threads{position:fixed;inset:0;z-index:4;pointer-events:none;overflow:visible}
-  .thread{fill:none;stroke:var(--thread);stroke-width:1.7;stroke-linecap:round;opacity:.55;
+  /* A stroke cannot taper, so the thread is two: a hairline over its whole length, and a heavier
+     haunch covering only the first third. Thick at the knot, fine where it lands. The per-thread
+     gradient carries the rest of the falloff, so it fades into the paragraph instead of stopping. */
+  #threadG stop{stop-color:var(--thread)}
+  #threadG .s0{stop-opacity:.9}
+  #threadG .s1{stop-opacity:.16}
+  .t-body{fill:none;stroke-width:1.15;stroke-linecap:round;
     stroke-dasharray:1;stroke-dashoffset:0;animation:tie .9s cubic-bezier(.35,0,.15,1)}
-  .shuttle{fill:none;stroke:var(--thread);stroke-width:3.2;stroke-linecap:round;opacity:.95;
+  .t-haunch{fill:none;stroke-width:3.2;stroke-linecap:round;
+    stroke-dasharray:.32 .68;stroke-dashoffset:0;animation:fadein .9s ease-out}
+  /* the shuttle's glow is a second wide low-alpha stroke rather than a blur filter: a filter region
+     spanning a viewport-long path would be repainted on every frame of every round */
+  .t-halo{fill:none;stroke:var(--thread);stroke-width:10;opacity:.15;stroke-linecap:round;
     stroke-dasharray:.05 .95;animation:run 1.7s linear infinite}
+  .t-core{fill:none;stroke:#fff2f4;stroke-width:2.5;opacity:.95;stroke-linecap:round;
+    stroke-dasharray:.032 .968;animation:run 1.7s linear infinite}
   @keyframes tie{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
   @keyframes run{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+  @keyframes fadein{from{opacity:0}to{opacity:1}}
   /* the smallest tail puff becomes the knot the thread is tied off at */
   .bub-wrap.weaving .bub::after{background:var(--thread);opacity:.9;
     box-shadow:0 0 10px rgba(192,35,60,.5)}
@@ -645,6 +658,7 @@ function releaseWeaving(){
 
 /* ---------- threads ---------- */
 const threadG = $('#threadG');
+let threadSeq = 0;
 const SVGNS = 'http://www.w3.org/2000/svg';
 const esc = v => (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&');
 
@@ -679,21 +693,37 @@ function drawThreads(){
     const t = host.getBoundingClientRect();
     if(!t.width && !t.height) continue;
     live.add(key);
-    const d = threadPath(b.left + b.width / 2, b.bottom - 6,
-                         t.left + t.width / 2, t.top + t.height / 2, bowOf(key));
+    const x1 = b.left + b.width / 2, y1 = b.bottom - 6;
+    const x2 = t.left + t.width / 2,  y2 = t.top + t.height / 2;
+    const d = threadPath(x1, y1, x2, y2, bowOf(key));
     let g = threadG.querySelector(`g[data-key="${esc(key)}"]`);
     if(!g){
       g = document.createElementNS(SVGNS, 'g');
       g.dataset.key = key;
-      for(const cls of ['thread', 'shuttle']){
+      const gid = 'tg' + (++threadSeq);
+      const grad = document.createElementNS(SVGNS, 'linearGradient');
+      grad.setAttribute('id', gid);
+      grad.setAttribute('gradientUnits', 'userSpaceOnUse');   // so it follows the path, not a bbox
+      for(const cls of ['s0', 's1']){
+        const stop = document.createElementNS(SVGNS, 'stop');
+        stop.setAttribute('offset', cls === 's0' ? '0' : '1');
+        stop.setAttribute('class', cls);
+        grad.append(stop);
+      }
+      g.append(grad);
+      for(const cls of ['t-body', 't-haunch', 't-halo', 't-core']){
         const path = document.createElementNS(SVGNS, 'path');
         path.setAttribute('class', cls);
-        path.setAttribute('pathLength', '1');
+        path.setAttribute('pathLength', '1');       // one unit, whatever the real length
+        if(cls === 't-body' || cls === 't-haunch') path.setAttribute('stroke', `url(#${gid})`);
         g.append(path);
       }
       threadG.append(g);
     }
-    for(const path of g.children) path.setAttribute('d', d);
+    const grad = g.firstElementChild;
+    grad.setAttribute('x1', x1.toFixed(1)); grad.setAttribute('y1', y1.toFixed(1));
+    grad.setAttribute('x2', x2.toFixed(1)); grad.setAttribute('y2', y2.toFixed(1));
+    for(const path of g.querySelectorAll('path')) path.setAttribute('d', d);
   }
   for(const g of [...threadG.children]) if(!live.has(g.dataset.key)) g.remove();
 }
