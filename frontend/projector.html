@@ -127,11 +127,13 @@
   #rail{display:flex;flex-direction:column;min-height:0;padding-top:14px}
   .rail-h{font-family:var(--soft);font-weight:600;font-size:13.5px;letter-spacing:.15em;
     text-transform:uppercase;color:var(--ink-3);margin-bottom:12px}
-  /* The queue floats above everything instead of sitting beside it. pointer-events:none so the
-     layer never intercepts anything on the page beneath it. */
-  #float{position:fixed;inset:0;z-index:5;pointer-events:none}
+  /* A band of its own above the story. It is a flex child rather than an overlay, so it reserves
+     its height and the text below can never run under it. overflow stays visible so a bubble that
+     is entering a round can fall out of the band and over the story as it dissolves. */
+  #float{position:relative;flex:none;height:clamp(150px,18vh,208px);z-index:5;
+    pointer-events:none;overflow:visible}
   #bubbles{position:absolute;inset:0}
-  .more{position:absolute;top:172px;right:48px;text-align:right}
+  .more{position:absolute;right:48px;bottom:6px;text-align:right}
   .bub{position:relative;font-family:var(--soft);font-weight:600;font-size:15.5px;line-height:1.4;
     padding:17px 23px;max-width:100%;color:#3f4b5e;
     background:linear-gradient(155deg,rgba(255,255,255,.88),color-mix(in srgb,var(--c) 16%,rgba(255,255,255,.74)));
@@ -152,7 +154,7 @@
      the same way the old infinite bob did. */
   /* Absolutely placed, so the queue shuffling is a transition of top/left rather than a reflow —
      which also means it honours reduced-motion for free, unlike a scripted animation. */
-  .bub-wrap{position:absolute;max-width:min(300px,21vw);
+  .bub-wrap{position:absolute;width:min(300px,17.5vw);
     animation:descend .9s cubic-bezier(.22,1,.36,1);
     transition:top 1.05s cubic-bezier(.22,1,.36,1),left 1.05s cubic-bezier(.22,1,.36,1),
       opacity .65s ease,transform .65s ease}
@@ -162,7 +164,7 @@
   @keyframes bob{0%,100%{transform:translateY(0) rotate(-.6deg);border-radius:30px 34px 28px 32px}
     50%{transform:translateY(-8px) rotate(.7deg);border-radius:34px 28px 32px 30px}}
   @keyframes descend{from{opacity:0;transform:translateY(-38px) scale(.92)}to{opacity:1;transform:none}}
-  .bub-wrap.going{opacity:0;transform:translate(-34px,44px) scale(.95)}
+  .bub-wrap.going{opacity:0;transform:translate(-10px,140px) scale(.94)}
   .bub b{display:block;font-weight:700;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;
     color:color-mix(in srgb,var(--c) 72%,#5a6678);margin-bottom:5px}
   .more{font-family:var(--soft);font-weight:600;font-size:14px;color:var(--ink-3);padding-left:6px}
@@ -193,7 +195,7 @@
   @media (max-width:1100px){
     #main{grid-template-columns:1fr;padding:0 22px 22px}
     #rail{display:none}
-    .bub-wrap{max-width:56vw}
+    .bub-wrap{width:30vw}
     .more{right:22px}
     header{padding:16px 22px 10px}
   }
@@ -213,6 +215,8 @@
   <span class="meta" id="meta">finding the loom…</span>
 </header>
 
+<div id="float"><div id="bubbles"></div></div>
+
 <div id="main">
   <div id="story"></div>
   <div id="rail">
@@ -221,8 +225,6 @@
     <div id="queuecount">the room is quiet</div>
   </div>
 </div>
-
-<div id="float"><div id="bubbles"></div></div>
 
 <div id="toast"></div>
 
@@ -397,10 +399,9 @@ function renderFrame(tokens){
 }
 
 /* ---------- the queue ---------- */
-/* Lanes by queue position rather than by hash: a hash puts neighbours on top of each other often
-   enough to be unreadable, and these are deliberately ordered so consecutive bubbles never land in
-   adjacent columns. A bubble glides to its new lane as the queue shifts under it. */
-const LANES = [5, 39, 19, 53, 31];
+/* The band holds one row. Position 0 is next to be woven: it sits leftmost and lowest, closest to
+   falling out of the band into the paragraph. Later arrivals queue up to its right and ride higher. */
+const BAND_X = 2, BAND_GAP = 19.4;
 const bubbles = new Map();                       // queue key -> .bub-wrap already on screen
 const keyOf = p => p.contributor + '|' + p.at + '|' + p.text;   // `at` alone collides when one
                                                  // person has two phrases stamped the same instant
@@ -436,10 +437,8 @@ function renderQueue(pending){
       el.append(b); host.append(el);
       bubbles.set(k, el);
     }
-    // The next phrase to be woven floats lowest, nearest the paragraph it is about to enter.
-    const rank = show.length - 1 - i;
-    el.style.top  = (8 + rank * 15) + '%';
-    el.style.left = LANES[rank % LANES.length] + '%';
+    el.style.left = (BAND_X + i * BAND_GAP) + '%';
+    el.style.top  = (86 - i * 15) + 'px';
   });
 
   const extra = pending.length - show.length;
