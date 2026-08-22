@@ -9,6 +9,11 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv is not installed (https://docs.astral.sh/uv/getting-started/installation/)." >&2
+  exit 1
+fi
+
 SESSION="loom"
 PORT="${LOOM_PORT:-8082}"
 # server.py shells out to `tailscale ip -4`, which isn't on PATH in every shell even when
@@ -33,6 +38,11 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "       find it with: lsof -iTCP:$PORT -sTCP:LISTEN" >&2
   exit 1
 fi
+
+# Sync out here, not inside tmux -- a resolution failure (no network, a bad pyproject.toml) should
+# fail loudly in this shell, not sit silently inside a detached pane nobody's attached to yet.
+echo "[run-loom] syncing dependencies (uv sync)..."
+uv sync
 
 tmux new-session -d -s "$SESSION" -n loom -e "LOOM_HOST=$LOOM_HOST" "uv run python3 loom/server.py"
 echo "[run-loom] started in tmux session '$SESSION' on port $PORT"
