@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiffusionGemma — denoising canvas</title>
+<style>
+  :root{
+    --bg:#0b0d11; --panel:#13161c; --panel2:#191d25; --line:#262c37;
+    --fg:#e8ebf1; --dim:#8b93a1; --accent:#7aa2f7; --think:#c99bf5;
+    --ok:#7ec699; --bad:#f07178; --hot:#ff7043;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --csize:14px;              /* canvas text size; bumped on small screens and by the A-/A+ buttons */
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  /* dvh so the composer isn't hidden under mobile browser chrome; ignored where unsupported */
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;
+    font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;height:100dvh}
+
+  header{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line);
+    background:var(--panel);flex-wrap:wrap;flex:none}
+  header h1{font-size:13px;margin:0;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+  .model{font:11px var(--mono);color:var(--dim)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
+  .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+  .spacer{flex:1}
+  label{font-size:11px;color:var(--dim);display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+  input,button,select{font-family:inherit;font-size:12px;color:var(--fg);background:var(--panel2);
+    border:1px solid var(--line);border-radius:6px;padding:4px 7px;outline:none}
+  input:focus{border-color:var(--accent)}
+  input[type=number]{width:62px} #api{width:172px;font:11px var(--mono)}
+  input[type=range]{width:90px;padding:0;accent-color:var(--accent);background:none;border:none}
+  button{cursor:pointer} button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.4;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#0b0d11;font-weight:600}
+  .val{font:11px var(--mono);color:var(--fg);min-width:26px;display:inline-block}
+  /* the settings group is layout-transparent on desktop, a drop-down panel on phones */
+  #controls{display:contents}
+  #gear{display:none}
+  .zoom{display:inline-flex;gap:4px}
+  .zoom button{font:11px var(--mono);padding:4px 6px;line-height:1}
+
+  /* narrow-screen overrides all live at the end of the sheet: media queries add no specificity,
+     so a rule here would lose to the plain #side/#canvas rules declared further down */
+  #layout{flex:1;display:grid;grid-template-columns:1fr 380px;min-height:0}
+
+  /* ---- canvas ---- */
+  #stage{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
+  #bar{display:flex;align-items:center;gap:14px;padding:7px 14px;border-bottom:1px solid var(--line);
+    background:var(--panel);font:11px var(--mono);color:var(--dim);flex:none;flex-wrap:wrap}
+  #bar b{color:var(--fg);font-weight:600}
+  #prog{flex:1;min-width:80px;height:4px;border-radius:2px;background:var(--panel2);overflow:hidden}
+  #prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .1s linear}
+  .legend{display:flex;gap:10px;align-items:center}
+  .sw{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:-1px}
+
+  #canvas{flex:1;overflow-y:auto;overflow-x:hidden;min-width:0;padding:16px;
+    font-family:var(--mono);font-size:var(--csize);line-height:1.85;
+    white-space:pre-wrap;overflow-wrap:anywhere;letter-spacing:.01em}
+  #canvas:empty::before{content:"the denoising canvas appears here — ask something below";
+    color:var(--dim);font:13px system-ui;letter-spacing:0}
+  .tk{border-radius:3px;padding:0 1px;transition:color .18s ease, background-color .18s ease}
+  /* churning: renoised this step. frozen: argmax held for N steps. */
+  .h0{color:#fff;background:var(--hot)}
+  .h1{color:#ffb59a}
+  .h2{color:#9aa3b2}
+  .h3{color:#6f7686}
+  .fz{color:var(--ok)}
+  .fz.chan{color:var(--think)}
+  /* text already committed by an earlier block: settled, no longer part of the live canvas */
+  #done{color:var(--fg)}
+  #done.chan{color:var(--think)}
+
+  /* ---- side ---- */
+  #side{display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+  .sec{border-bottom:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .sec>h2{margin:0;padding:8px 12px;font:11px var(--mono);color:var(--dim);letter-spacing:.08em;
+    text-transform:uppercase;background:var(--panel2);flex:none}
+  .sec .body{padding:10px 12px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-size:13px}
+  #answer{flex:2;min-height:120px}
+  #thought{flex:3;min-height:0}
+  #thought .body{color:#cbb6e0;font-size:12.5px}
+  #statsbox{flex:none;font:11px var(--mono);color:var(--dim);padding:9px 12px;display:grid;
+    grid-template-columns:auto 1fr;gap:2px 10px;max-height:170px;overflow-y:auto}
+  #statsbox b{color:var(--fg);font-weight:600;text-align:right}
+  .err{margin:10px 12px;border:1px solid #5a2c30;background:#241416;color:var(--bad);border-radius:8px;
+    padding:8px 10px;font:11px var(--mono);white-space:pre-wrap}
+
+  /* ---- composer ---- */
+  footer{flex:none;border-top:1px solid var(--line);background:var(--panel);padding:10px 14px}
+  .composer{display:flex;gap:8px;align-items:flex-end}
+  textarea{flex:1;resize:none;min-height:38px;max-height:130px;font:13px/1.5 inherit;color:var(--fg);
+    background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;outline:none}
+  textarea:focus{border-color:var(--accent)}
+  .turns{font:11px var(--mono);color:var(--dim);margin-top:6px;display:flex;gap:12px;flex-wrap:wrap}
+
+  /* the model string is the first thing to go when the header would otherwise wrap onto a
+     second row and steal canvas height; the status dot still reports reachability */
+  @media (max-width:1560px){ .model{display:none} }
+
+  /* ---- no room for the side panel: the canvas takes the full width ---- */
+  @media (max-width:1000px){
+    #layout{grid-template-columns:1fr}
+    #side{display:none}
+    #stage{border-right:none}
+  }
+
+  /* ---- phones: the canvas is the point, so give it every pixel the chrome doesn't need ---- */
+  @media (max-width:760px){
+    :root{--csize:19px}
+    header{padding:7px 10px;gap:8px}
+    header h1{font-size:12px}
+    .model{display:none}
+    #gear{display:inline-flex}
+    /* controls collapse behind the gear; opening them wraps a panel under the header */
+    #controls{display:none;order:9;width:100%;flex-wrap:wrap;gap:9px 12px;
+      padding-top:9px;margin-top:2px;border-top:1px solid var(--line)}
+    #controls.open{display:flex}
+    #controls label{flex:0 1 auto}
+    #api{width:100%} #controls label:has(#api){flex:1 1 100%}
+    #bar{padding:6px 10px;gap:9px;font-size:10px}
+    #canvas{padding:12px 10px;line-height:1.7}
+    footer{padding:8px 10px}
+    /* 16px keeps iOS from zooming the whole page when the field takes focus */
+    textarea{font-size:16px;min-height:42px}
+    .turns{display:none}
+  }
+  @media (max-width:620px){ .legend{display:none} }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>DiffusionGemma</h1>
+  <span class="model" id="model">connecting…</span>
+  <span class="spacer"></span>
+  <div id="controls">
+    <label>api <input id="api" spellcheck="false"></label>
+    <label title="rounded up to whole 256-token diffusion blocks">tokens <input id="maxtok" type="number" value="512" min="256" step="256"></label>
+    <label>steps <input id="steps" type="range" min="4" max="96" step="4" value="48"><span class="val" id="stepsv">48</span></label>
+    <label>entropy <input id="ebound" type="range" min="0.02" max="0.6" step="0.02" value="0.1"><span class="val" id="eboundv">0.10</span></label>
+    <label title="noise temperature at the first step; the schedule anneals to half this">temp <input id="temp" type="range" min="0.3" max="1.2" step="0.05" value="0.8"><span class="val" id="tempv">0.80</span></label>
+    <label>seed <input id="seed" type="number" placeholder="rnd"></label>
+    <label title="render every Nth denoising step">fps <input id="every" type="number" value="1" min="1" max="8"></label>
+    <button id="clear">clear</button>
+  </div>
+  <!-- after #controls in the DOM so these sit at the far right on desktop; on phones
+       #controls is order:9, so the zoom/gear pair still renders above the panel -->
+  <span class="zoom">
+    <button id="zout" title="smaller canvas text">A−</button>
+    <button id="zin" title="bigger canvas text">A+</button>
+  </span>
+  <button id="gear" title="settings">⚙</button>
+</header>
+
+<div id="layout">
+  <div id="stage">
+    <div id="bar">
+      <span>block <b id="b_block">–</b></span>
+      <span>step <b id="b_step">–</b></span>
+      <span>frozen <b id="b_frozen">–</b></span>
+      <div id="prog"><i></i></div>
+      <span class="legend">
+        <span><i class="sw" style="background:var(--hot)"></i>churning</span>
+        <span><i class="sw" style="background:var(--ok)"></i>frozen</span>
+        <span><i class="sw" style="background:var(--think)"></i>thought</span>
+      </span>
+      <span><b id="b_time">0.0s</b></span>
+    </div>
+    <div id="canvas"></div>
+    <footer>
+      <div class="composer">
+        <textarea id="input" placeholder="Ask something…  (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="send" class="primary">send</button>
+        <button id="stop" disabled>stop</button>
+      </div>
+      <div class="turns"><span id="turns">no history</span><span id="hint"></span></div>
+    </footer>
+  </div>
+
+  <div id="side">
+    <div class="sec" id="answer"><h2>answer</h2><div class="body" id="answerBody"></div></div>
+    <div class="sec" id="thought"><h2>thought channel</h2><div class="body" id="thoughtBody"></div></div>
+    <div class="sec" style="flex:none"><h2>stats</h2><div id="statsbox"></div></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const canvasEl = $('#canvas');
+
+/* ---------- config ---------- */
+const guess = `${location.protocol}//${location.hostname || '127.0.0.1'}:8080`;
+$('#api').value = localStorage.getItem('dg_api') || guess;
+$('#api').onchange = () => { localStorage.setItem('dg_api', $('#api').value.trim()); health(); };
+const base = () => $('#api').value.trim().replace(/\/+$/,'').replace(/\/v1$/,'');
+
+const bind = (r, out, fmt) => {
+  const el = $(r), o = $(out);
+  const upd = () => o.textContent = fmt(el.value);
+  el.addEventListener('input', upd); upd();
+};
+bind('#steps', '#stepsv', v => v);
+bind('#ebound', '#eboundv', v => (+v).toFixed(2));
+bind('#temp', '#tempv', v => (+v).toFixed(2));
+
+/* canvas text size: CSS picks the per-screen default, an explicit choice overrides and persists */
+const stored = localStorage.getItem('dg_csize');
+if(stored) document.documentElement.style.setProperty('--csize', stored + 'px');
+const curSize = () =>
+  parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--csize')) || 14;
+function bumpSize(d){
+  const n = Math.max(10, Math.min(34, Math.round(curSize()) + d));
+  document.documentElement.style.setProperty('--csize', n + 'px');
+  try{ localStorage.setItem('dg_csize', n); }catch{}
+}
+$('#zout').onclick = () => bumpSize(-1);
+$('#zin').onclick  = () => bumpSize(+1);
+$('#gear').onclick = () => $('#controls').classList.toggle('open');
+
+async function health(){
+  try{
+    const j = await (await fetch(base()+'/health')).json();
+    $('#dot').className = 'dot ' + (j.status==='ok'?'ok':'bad');
+    $('#model').textContent = `${j.model} · ctx ${j.maxtok}`;
+  }catch{
+    $('#dot').className = 'dot bad';
+    $('#model').textContent = 'unreachable';
+  }
+}
+health(); setInterval(health, 15000);
+
+/* ---------- canvas ----------
+   The entropy-bound decoder has no mask token: every position always holds an argmax token, and
+   positions FREEZE as their entropy drops while unaccepted ones are renoised each step. So we track,
+   per position, how many consecutive steps its token has been unchanged, and colour by that age.
+   That is the same `held` signal the decoder uses internally to decide it has converged.            */
+const HEAT = ['h0','h1','h2','h3'];        // age 0,1,2,3+ steps unchanged
+const FROZEN_AT = 4;                        // unchanged this long -> treat as settled
+let cells = [];                             // live canvas: [{el, text, age}]
+let doneEl = null;                          // text committed by earlier blocks, ahead of the live canvas
+
+function resetCanvas(){
+  canvasEl.innerHTML = '';
+  doneEl = document.createElement('span');
+  doneEl.id = 'done';
+  canvasEl.appendChild(doneEl);
+  cells = [];
+}
+
+// Each block denoises its OWN fresh canvas_length canvas, so when a block commits we freeze its text
+// into `doneEl` and start the next block's frames from an empty live region. Reusing the cells would
+// make block N+1 overwrite block N's committed text.
+function commitBlock(rawText){
+  doneEl.textContent = rawText;
+  for(const c of cells) c.el.remove();
+  cells = [];
+}
+
+function renderFrame(tokens){
+  // grow/shrink the DOM to match the canvas width, then update only what changed
+  while(cells.length < tokens.length){
+    const el = document.createElement('span');
+    el.className = 'tk';
+    canvasEl.appendChild(el);
+    cells.push({el, text:null, age:0});
+  }
+  while(cells.length > tokens.length) cells.pop().el.remove();
+
+  let frozen = 0, chan = false;
+  for(let i=0;i<tokens.length;i++){
+    const c = cells[i], t = tokens[i];
+    if(c.text !== t){
+      c.text = t; c.age = 0;
+      c.el.textContent = t;
+    }else if(c.age < 99) c.age++;
+
+    // the model's reasoning is wrapped in <|channel> ... <channel|>; tint that span
+    if(t.includes('<|channel')) chan = true;
+    const settled = c.age >= FROZEN_AT;
+    if(settled) frozen++;
+    const cls = 'tk ' + (settled ? ('fz' + (chan ? ' chan' : '')) : HEAT[Math.min(c.age, 3)]);
+    if(c.el.className !== cls) c.el.className = cls;
+    if(t.includes('channel|>')) chan = false;
+  }
+  return frozen;
+}
+
+/* ---------- run ---------- */
+let history = [], ctl = null;
+
+function setStats(o){
+  const box = $('#statsbox');
+  box.innerHTML = '';
+  for(const [k,v] of Object.entries(o)){
+    const a = document.createElement('span'), b = document.createElement('b');
+    a.textContent = k; b.textContent = v;
+    box.append(b, a);
+  }
+}
+function showErr(msg){
+  const e = document.createElement('div');
+  e.className = 'err'; e.textContent = msg;
+  $('#side').appendChild(e);
+  setTimeout(()=>e.remove(), 12000);
+}
+
+async function send(){
+  const text = $('#input').value.trim();
+  if(!text || ctl) return;
+  $('#input').value = ''; $('#input').style.height='auto';
+  $('#controls').classList.remove('open');   // get the settings panel out of the way on phones
+  history.push({role:'user', content:text});
+  $('#turns').textContent = `${history.length} message${history.length>1?'s':''} in context`;
+
+  resetCanvas();
+  $('#answerBody').textContent = '';
+  $('#thoughtBody').textContent = '';
+  setStats({});
+  ctl = new AbortController();
+  $('#send').disabled = true; $('#stop').disabled = false;
+
+  const t0 = performance.now();
+  const tick = setInterval(()=>{ $('#b_time').textContent = ((performance.now()-t0)/1000).toFixed(1)+'s'; }, 100);
+
+  const body = {
+    messages: history,
+    max_tokens: parseInt($('#maxtok').value) || 256,
+    frame_every: parseInt($('#every').value) || 1,
+    eb_max_steps: parseInt($('#steps').value),
+    eb_entropy_bound: parseFloat($('#ebound').value),
+    // the reference schedule anneals t_max -> t_max/2 (0.8 -> 0.4), so keep that ratio
+    eb_t_max: parseFloat($('#temp').value),
+    eb_t_min: +($('#temp').value / 2).toFixed(3),
+  };
+  const seed = $('#seed').value.trim();
+  if(seed !== '') body.seed = parseInt(seed);
+
+  let answer = '', frames = 0;
+  try{
+    const r = await fetch(base()+'/v1/diffusion/stream', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body), signal: ctl.signal,
+    });
+    if(!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0,300)}`);
+
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for(;;){
+      const {value, done} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, {stream:true});
+      const lines = buf.split('\n'); buf = lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if(raw === '[DONE]') continue;
+        let ev; try{ ev = JSON.parse(raw); }catch{ continue; }
+
+        if(ev.type === 'frame'){
+          frames++;
+          const frozen = renderFrame(ev.tokens);
+          $('#b_block').textContent = ev.block + 1;
+          $('#b_step').textContent  = `${ev.step + 1}/${ev.total}`;
+          $('#b_frozen').textContent = `${frozen}/${ev.tokens.length}`;
+          $('#prog i').style.width = ((ev.step + 1) / ev.total * 100) + '%';
+        }else if(ev.type === 'commit'){
+          answer = ev.answer || '';
+          $('#answerBody').textContent = answer;
+          $('#thoughtBody').textContent = ev.reasoning || '';
+          $('#thoughtBody').scrollTop = $('#thoughtBody').scrollHeight;
+          commitBlock(ev.raw || answer);
+          canvasEl.scrollTop = canvasEl.scrollHeight;
+        }else if(ev.type === 'stats'){
+          const s = {...ev}; delete s.type;
+          s.frames_rendered = frames;
+          s.wall_s = ((performance.now()-t0)/1000).toFixed(1);
+          setStats(s);
+        }else if(ev.type === 'error'){
+          throw new Error(ev.message);
+        }
+      }
+    }
+    if(answer) history.push({role:'assistant', content:answer});
+    else history.pop();
+  }catch(e){
+    if(e.name !== 'AbortError') showErr(String(e.message || e));
+    history.pop();
+  }finally{
+    clearInterval(tick);
+    $('#prog i').style.width = '100%';
+    ctl = null;
+    $('#send').disabled = false; $('#stop').disabled = true;
+    $('#turns').textContent = history.length ? `${history.length} messages in context` : 'no history';
+    $('#input').focus();
+  }
+}
+
+$('#send').onclick = send;
+$('#stop').onclick = () => ctl?.abort();
+$('#clear').onclick = () => {
+  history = []; resetCanvas(); setStats({});
+  $('#answerBody').textContent=''; $('#thoughtBody').textContent='';
+  $('#turns').textContent='no history';
+};
+$('#input').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$('#input').addEventListener('input', e => {
+  e.target.style.height='auto';
+  e.target.style.height=Math.min(e.target.scrollHeight,130)+'px';
+});
+$('#input').focus();
+</script>
+</body>
+</html>

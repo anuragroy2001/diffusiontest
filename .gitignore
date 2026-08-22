@@ -1,0 +1,27 @@
+# ---- Model weights (26 GB) -------------------------------------------------
+models/
+*.gguf
+
+# ---- Vendored upstream: llama.cpp -----------------------------------------
+# Its own git checkout (branch pr-24423, ~440 MB with build/ and models/).
+# Clone it yourself and apply patches/llama.cpp-diffusion-pins.patch.
+llama.cpp/
+
+# ---- Logs & runtime state --------------------------------------------------
+*.log
+.requests/
+
+# ---- Local scratch / backups -----------------------------------------------
+.pinpatch-backup/
+
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- Editor / OS -----------------------------------------------------------
+.claude/settings.local.json
+.DS_Store
+*.swp

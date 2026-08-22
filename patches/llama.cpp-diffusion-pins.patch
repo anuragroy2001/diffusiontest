@@ -1,0 +1,341 @@
+# DiffusionGemma pinned-token patch for llama.cpp
+#
+# upstream : https://github.com/ggml-org/llama.cpp.git
+# branch   : pr-24423
+# base     : daca8075d871483545dd85d58ce11970b304b541
+#
+# Apply with:  git -C llama.cpp apply patches/llama.cpp-diffusion-pins.patch
+#
+diff --git a/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp b/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
+index c4a19a856..d1ddbe2ce 100644
+--- a/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
++++ b/examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp
+@@ -9,10 +9,22 @@
+ //
+ // Protocol (synchronous, one request per line on stdin):
+ //   stdin  : a line containing a request-file path R
+-//   file R : UTF-8 JSON  {"seed": <int>, "n_blocks": <int>, "messages": [ {"role","content"}, ... ]}
++//   file R : {"op":"tokenize", "texts":[str,...], "special":bool} -> "T <json>" (per text, the list of
++//            token pieces) then DONE. Lets a client lay out pins without shipping tokenizer files.
++//   file R : UTF-8 JSON  {"seed": <int>, "n_blocks": <int>, "messages": [ {"role","content"}, ... ],
++//                         optional entropy-bound overrides: "eb_max_steps", "eb_entropy_bound",
++//                         "eb_t_max", "eb_t_min", "eb_confidence", "eb_stability",
++//                         optional "pins": [ {"pos": <int>, "text": <str>, "block": <int>, "id": <str>} ]
++//                           freeze `text` into the canvas of `block` (default 0) starting at canvas position
++//                           `pos`, so the rest of the canvas denoises AROUND it. Tokenized here, so include
++//                           the leading space for a mid-sentence phrase. `id` is opaque and echoed back in P.}
+ //            (messages are OpenAI chat-completion format; the GGUF chat template is applied here)
+-//   stdout : a stream of newline records, then "DONE":
+-//              F <block> <step> <total> <json-string>   one per denoising step (current canvas, decoded)
++//   stdout : "BEGIN <R>" echoing the request id, then a stream of newline records, then "DONE":
++//              P <block> <json-array>                   where this block's pins landed after tokenization:
++//                                                       [{pos,len,text,id}], emitted before the block's first
++//                                                       F. len 0 means the span fell off the canvas edge.
++//              F <block> <step> <total> <json-array>    one per denoising step (canvas, one string per
++//                                                       position; join for text). Non-monotonic.
+ //              C <block> <json-string>                  cumulative committed answer text after this block
+ //              STATS <key=value ...>                    one summary line (counts + ms timing) before DONE
+ //              DONE                                      end of this request
+@@ -41,6 +53,16 @@
+ #include <string>
+ #include <vector>
+ 
++// A single token's piece is often only PART of a multi-byte UTF-8 character -- byte-fallback tokens are
++// individual bytes, and the entropy-bound decoder random-initialises every canvas position, so partial
++// sequences turn up constantly. nlohmann::json::dump() THROWS on those, and the frame callback runs
++// outside any try: one unlucky position aborts the whole process mid-generation. Replace the invalid
++// bytes with U+FFFD instead. This is a visualization stream; a replacement character in one cell for one
++// step is invisible, and the `C` records remain the authoritative text.
++static std::string dump_lossy(const nlohmann::json & j) {
++    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
++}
++
+ static std::string read_text_file(const std::string & path) {
+     FILE * f = fopen(path.c_str(), "rb");
+     if (!f) return {};
+@@ -54,6 +76,16 @@ static std::string read_text_file(const std::string & path) {
+     return s;
+ }
+ 
++// One caller-frozen span. The text is tokenized here (this process owns the vocab) and laid into the canvas
++// of `block` starting at `pos`; `id` is opaque, echoed back in the P record so a UI can attribute the span.
++struct pin_req {
++    int32_t     block   = 0;
++    int32_t     pos     = 0;
++    std::string text;
++    std::string id;
++    bool        special = false;   // opt-in: parse control tokens in `text`. Off for anything a user typed.
++};
++
+ // per-request callback state: which block we are on, where to stream frames, and how to decode them
+ struct vis_cb_data {
+     int                  block   = 0;
+@@ -65,7 +97,7 @@ struct vis_cb_data {
+ };
+ 
+ // Stream the current argmax canvas (tokens[n_input .. n_tokens)) as one "F" record per denoising step,
+-// decoded to text and JSON-escaped so it survives the line protocol intact (spaces/newlines/unicode).
++// as a JSON array of per-position pieces, escaped so it survives the line protocol intact.
+ static bool vis_step_callback(int32_t step, int32_t total_steps, const llama_token * tokens,
+                               int32_t n_tokens, void * user_data) {
+     auto * d = (vis_cb_data *) user_data;
+@@ -76,9 +108,18 @@ static bool vis_step_callback(int32_t step, int32_t total_steps, const llama_tok
+     // overhead added to the generation loop. Time it so STATS can report model decode time separately from
+     // the visualization cost (this is exactly why the visualization-inclusive tok/s looks ~10x slow).
+     const int64_t t0 = ggml_time_us();
+-    std::vector<llama_token> canvas(tokens + d->n_input, tokens + n_tokens);
+-    const std::string text = common_detokenize(d->vocab, canvas, /*special*/ false);
+-    fprintf(d->out, "F %d %d %d %s\n", d->block, step, total_steps, nlohmann::json(text).dump().c_str());
++    // Emit the canvas one piece per position instead of a single detokenized string. The entropy-bound
++    // decoder renoises every position it did not accept this step, so what a viewer needs to see is WHICH
++    // positions changed - and a flat string loses the token boundaries that make that visible. The client
++    // derives per-position stability by diffing consecutive frames (same as the decoder's own `held`).
++    // `C` records remain the authoritative answer text; these frames are visualization only.
++    nlohmann::json pieces = nlohmann::json::array();
++    for (int i = d->n_input; i < n_tokens; i++) {
++        // special=true to match the `C` records: the <|channel> markers are part of what a viewer
++        // wants to see resolve, and the client tints the reasoning span with them.
++        pieces.push_back(common_token_to_piece(d->vocab, tokens[i], /*special*/ true));
++    }
++    fprintf(d->out, "F %d %d %d %s\n", d->block, step, total_steps, dump_lossy(pieces).c_str());
+     fflush(d->out);
+     d->viz_us += ggml_time_us() - t0;
+     return true;
+@@ -292,17 +333,62 @@ int main(int argc, char ** argv) {
+         if (L == 0) continue;
+         if (strcmp(line, "QUIT") == 0) break;
+ 
++        // Echo the request id (the request-file path) before doing anything else. Generation is
++        // synchronous and cannot be cancelled, so a client that disconnects mid-request leaves its
++        // remaining records in the pipe; without this sentinel the next client reads THOSE and every
++        // reply from then on is one request stale.
++        printf("BEGIN %s\n", line); fflush(stdout);
++
+         const int64_t t_req0 = ggml_time_us();
+ 
+         // parse the request file: {"seed", "n_blocks", "messages":[...]} -> chat template -> token prefix
+         int seed = 0, n_blocks = 1;
++        // Per-request entropy-bound overrides; unset keys keep the GGUF/reference defaults in `base`.
++        // These are exactly the CLI's --diffusion-eb-* knobs, made per-request so a UI can drive them.
++        diffusion_eb_params req_eb = base;
+         std::vector<llama_token> prefix;
++        std::vector<pin_req> pins;
+         try {
+             const std::string raw = read_text_file(line);
+             if (raw.empty()) { printf("ERR badreq\n"); fflush(stdout); continue; }
+             const nlohmann::ordered_json req = nlohmann::ordered_json::parse(raw);
++            // Pin layout is decided client-side, but only this process owns the vocab -- so callers that
++            // need to know how long a span will be ask here, through the same tokenizer path pins take.
++            if (req.value("op", std::string()) == "tokenize") {
++                const bool sp = req.value("special", false);
++                nlohmann::json out = nlohmann::json::array();
++                for (const auto & s : req.value("texts", std::vector<std::string>{})) {
++                    nlohmann::json pieces = nlohmann::json::array();
++                    for (const llama_token tok : common_tokenize(vocab, s, false, sp)) {
++                        pieces.push_back(common_token_to_piece(vocab, tok, /*special*/ true));
++                    }
++                    out.push_back(pieces);
++                }
++                printf("T %s\n", dump_lossy(out).c_str());
++                printf("DONE\n");
++                fflush(stdout);
++                continue;
++            }
+             seed     = req.value("seed", 0);
+             n_blocks = req.value("n_blocks", 1);
++            req_eb.max_denoising_steps  = req.value("eb_max_steps",  base.max_denoising_steps);
++            req_eb.t_max                = req.value("eb_t_max",      base.t_max);
++            req_eb.t_min                = req.value("eb_t_min",      base.t_min);
++            req_eb.entropy_bound        = req.value("eb_entropy_bound", base.entropy_bound);
++            req_eb.stability_threshold  = req.value("eb_stability",  base.stability_threshold);
++            req_eb.confidence_threshold = req.value("eb_confidence", base.confidence_threshold);
++            req_eb.max_denoising_steps  = std::max(1, req_eb.max_denoising_steps);
++            if (req.contains("pins")) {
++                for (const auto & p : req.at("pins")) {
++                    pin_req pr;
++                    pr.block = p.value("block", 0);
++                    pr.pos   = p.value("pos", 0);
++                    pr.text    = p.value("text", std::string());
++                    pr.id      = p.value("id", std::string());
++                    pr.special = p.value("special", false);
++                    if (!pr.text.empty()) { pins.push_back(std::move(pr)); }
++                }
++            }
+             std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
+             common_chat_templates_inputs inputs;
+             inputs.messages              = messages;
+@@ -334,7 +420,7 @@ int main(int argc, char ** argv) {
+                 break;
+             }
+ 
+-            diffusion_eb_params eb = base;
++            diffusion_eb_params eb = req_eb;
+             eb.max_length              = max_length;
+             eb.seed                    = seed + b;   // distinct per block, deterministic from the request seed
+             eb.visual_mode             = true;
+@@ -342,6 +428,34 @@ int main(int argc, char ** argv) {
+             eb.step_callback           = vis_step_callback;
+             eb.step_callback_user_data = &cb;
+ 
++            // Lay this block's pins into a canvas-sized array (LLAMA_TOKEN_NULL = position left free) and
++            // report where each span actually landed. parse_special defaults OFF: a submitted phrase is text,
++            // not markup, and must never be able to inject a <|channel> or an EOG token into the canvas. A
++            // trusted caller opts in per pin with "special": true -- e.g. to prime position 0 with an empty
++            // thought channel so the model spends the canvas on prose instead of planning notes.
++            std::vector<llama_token> pin_canvas((size_t) canvas_length, LLAMA_TOKEN_NULL);
++            nlohmann::json placed = nlohmann::json::array();
++            bool any_pins = false;
++            for (const pin_req & pr : pins) {
++                if (pr.block != b) { continue; }
++                const std::vector<llama_token> t =
++                    common_tokenize(vocab, pr.text, /*add special*/ false, /*parse special*/ pr.special);
++                int32_t first = -1, n_placed = 0;
++                for (size_t k = 0; k < t.size(); k++) {
++                    const int64_t at = (int64_t) pr.pos + (int64_t) k;
++                    if (at < 0 || at >= canvas_length) { continue; }   // clipped at the canvas edge
++                    pin_canvas[(size_t) at] = t[k];
++                    if (first < 0) { first = (int32_t) at; }
++                    n_placed++;
++                    any_pins = true;
++                }
++                placed.push_back({{"pos", first}, {"len", n_placed}, {"text", pr.text}, {"id", pr.id}});
++            }
++            eb.pinned = any_pins ? pin_canvas.data() : nullptr;
++            if (!placed.empty()) {   // before the first F, so a UI can colour the spans from step 0
++                printf("P %d %s\n", b, dump_lossy(placed).c_str()); fflush(stdout);
++            }
++
+             int32_t n_generated = 0;
+             diffusion_generate_entropy_bound(ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
+             if (n_generated <= prefix_len) { if (b == 0) printf("ERR gen\n"); break; }
+@@ -357,7 +471,7 @@ int main(int argc, char ** argv) {
+             answer.insert(answer.end(), canvas, canvas + cut);
+             // special=true: keep the <|channel> markers so the client can split out the reasoning
+             const std::string answer_text = common_detokenize(vocab, answer, /*special*/ true);
+-            printf("C %d %s\n", b, nlohmann::json(answer_text).dump().c_str()); fflush(stdout);
++            printf("C %d %s\n", b, dump_lossy(nlohmann::json(answer_text)).c_str()); fflush(stdout);
+             total_viz_us += ggml_time_us() - tc0;
+ 
+             if (cut < (size_t) canvas_length) break;                 // eog / repetition loop: answer complete
+@@ -373,9 +487,12 @@ int main(int argc, char ** argv) {
+             const double wall_ms           = (double) (t_gen - t_prompt) / 1000.0;
+             const double decode_ms         = (double) ((t_gen - t_prompt) - total_viz_us) / 1000.0;
+             printf("STATS prompt_n=%d predicted_n=%d prompt_prepare_ms=%.3f wall_ms=%.3f decode_ms=%.3f "
+-                   "blocks=%d steps=%d canvas=%d n_ctx=%d\n",
++                   "blocks=%d steps=%d canvas=%d n_ctx=%d eb_max_steps=%d eb_entropy_bound=%.4f "
++                   "eb_t_max=%.3f eb_t_min=%.3f eb_confidence=%.5f\n",
+                    P, (int) answer.size(), prompt_prepare_ms, wall_ms, decode_ms,
+-                   blocks_run, total_steps, (int) canvas_length, MAXTOK);
++                   blocks_run, total_steps, (int) canvas_length, MAXTOK,
++                   req_eb.max_denoising_steps, req_eb.entropy_bound,
++                   req_eb.t_max, req_eb.t_min, req_eb.confidence_threshold);
+             fflush(stdout);
+         }
+         printf("DONE\n"); fflush(stdout);
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 73649473f..64041ea43 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -438,7 +438,8 @@ void diffusion_generate(llama_context *          ctx,
+ // random-initialized; each step samples a candidate per position, accepts the lowest-entropy positions
+ // within a mutual-information bound, and renoises the rest under a linear temperature schedule. The output
+ // is the stable argmax canvas. Mirrors the reference transformers EntropyBoundSampler; set_sc is a no-op
+-// for non-DiffusionGemma models.
++// for non-DiffusionGemma models. params.pinned optionally freezes chosen canvas positions to caller-supplied
++// tokens; the rest of the canvas then denoises around them (see diffusion_eb_params::pinned).
+ void diffusion_generate_entropy_bound(llama_context *             ctx,
+                                       const llama_token *         input_tokens,
+                                       llama_token *               output_tokens,
+@@ -468,9 +469,15 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+     std::uniform_real_distribution<float>  uni01(0.0f, 1.0f);
+     std::uniform_int_distribution<int32_t> vocab_dist(0, n_vocab - 1);
+ 
++    // Pinned positions hold their token for the whole run: they seed the canvas, survive every renoise, and
++    // are re-asserted after each step's sampling. The random token is still drawn for them so the RNG stream
++    // -- and therefore an unpinned run at the same seed -- is bit-identical to before.
++    const llama_token * pinned = params.pinned;
++
+     std::vector<llama_token> current_canvas(C);                    // working (renoised) canvas, fed to the forward
+     for (int32_t i = 0; i < C; i++) {
+-        current_canvas[i] = vocab_dist(rng);                      // random init (not mask)
++        const llama_token r = vocab_dist(rng);                    // random init (not mask)
++        current_canvas[i] = (pinned && pinned[i] >= 0) ? pinned[i] : r;
+     }
+ 
+     // previous step's raw logits, for self-cond (host upload path only; device SC keeps them on-device)
+@@ -640,6 +647,18 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+             run_host_worker();
+         }
+ 
++        // Re-assert the pins over whatever the model predicted there. Zero entropy sorts them first in the
++        // acceptance order and contributes nothing to the cumulative bound, so the free positions get exactly
++        // the budget they would have had with no pins at all.
++        if (pinned) {
++            for (int32_t pos = 0; pos < C; pos++) {
++                if (pinned[pos] < 0) { continue; }
++                entropy[pos]       = 0.0f;
++                argmax_canvas[pos] = pinned[pos];
++                denoiser[pos]      = pinned[pos];
++            }
++        }
++
+         // accept the lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
+         std::iota(order.begin(), order.end(), 0);
+         std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return entropy[a] < entropy[b]; });
+@@ -650,18 +669,26 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
+             cumE += entropy[pos];
+             if (cumE - entropy[pos] <= params.entropy_bound) { accepted[pos] = 1; }
+         }
++        if (pinned) {   // a pin is never renoised, whatever the bound decided
++            for (int32_t pos = 0; pos < C; pos++) {
++                if (pinned[pos] >= 0) { accepted[pos] = 1; }
++            }
++        }
+ 
+         // renoise: accepted -> sampled token, rest -> fresh random; the displayed/output canvas is the argmax
+-        float entropy_sum = 0.0f;
++        float   entropy_sum = 0.0f;
++        int32_t n_free      = 0;
+         for (int32_t pos = 0; pos < C; pos++) {
+             current_canvas[pos]          = accepted[pos] ? denoiser[pos] : renoise[pos];
+             output_tokens[n_input + pos] = argmax_canvas[pos];
+-            entropy_sum += entropy[pos];
++            if (!pinned || pinned[pos] < 0) { entropy_sum += entropy[pos]; n_free++; }
+         }
+ 
+         // adaptive stop: argmax stable for stability_threshold steps AND confident (low mean entropy)
+         held = (prev_argmax == argmax_canvas) ? held + 1 : 0;
+-        const bool confident = (entropy_sum / (float) C) < params.confidence_threshold;
++        // mean entropy over the positions the model is actually free to choose: pins are zero-entropy by
++        // construction, so counting them would let a heavily pinned canvas declare convergence early
++        const bool confident = (entropy_sum / (float) std::max(1, n_free)) < params.confidence_threshold;
+         if (held >= params.stability_threshold && confident) { finished = true; }
+         prev_argmax   = argmax_canvas;
+         prev_temp_inv = temp_inv;
+diff --git a/examples/diffusion/diffusion.h b/examples/diffusion/diffusion.h
+index a7f305e29..566289c34 100644
+--- a/examples/diffusion/diffusion.h
++++ b/examples/diffusion/diffusion.h
+@@ -73,6 +73,7 @@ struct diffusion_eb_params {
+     float   confidence_threshold = 0.005f; // stop once mean canvas entropy drops below this
+     int32_t seed                 = 0;
+     int32_t max_length           = 0;      // n_input + canvas_length
++
+     bool    kv_cache             = false;  // prefix-KV-cache the prompt (PREFILL once, decode canvas-only
+                                            // per step) instead of re-decoding [prompt|canvas] every step
+     bool    gpu_sampling         = false;  // device-resident self-conditioning: keep the prev step's canvas
+@@ -82,6 +83,14 @@ struct diffusion_eb_params {
+                                            // the GPU from sc_dev (skips the 268 MB logits D2H + host reductions).
+                                            // Requires gpu_sampling. FP-equivalent: argmax exact, Z/entropy ~1e-4.
+ 
++    // Caller-frozen canvas positions: an array of (max_length - n_input) tokens where >= 0 pins that
++    // position to that token for the whole denoise and LLAMA_TOKEN_NULL leaves it free. Pinned positions
++    // are never renoised and cost nothing against the entropy bound, so the free positions reweave
++    // around them. Attention is non-causal, so canvas text BEFORE a pin reacts to it too.
++    // Tokenize the pinned text exactly as it should appear: a mid-sentence phrase usually needs its
++    // leading space, since that space is part of the first token.
++    const llama_token *       pinned               = nullptr;
++
+     diffusion_step_callback_t step_callback           = nullptr;
+     void *                    step_callback_user_data = nullptr;
+     bool                      visual_mode             = false;
