@@ -256,15 +256,6 @@
 
 <div id="toast"></div>
 
-<div id="composer">
-  <div class="ch"><span id="composerLabel">revising a line</span><button type="button" class="close" id="composerClose">&times;</button></div>
-  <div id="composerPara"></div>
-  <div id="composerRow">
-    <textarea id="composerText" maxlength="240" placeholder="a stolen accordion…"></textarea>
-    <button type="button" id="composerSend">throw it in</button>
-  </div>
-</div>
-
 <div id="lapse">
   <div class="lh"><span id="lapseRound">round</span><span id="lapseKind"></span></div>
   <div id="lapseText"></div>
@@ -342,6 +333,8 @@ let weavingBlock = null, weavingKind = null, weavingRetro = false;
 const weavingEl = () => $(`.para[data-i="${weavingBlock}"]`);
 
 function renderStory(){
+  // the story moved beneath an in-place edit (commit, split, round start) — let go, don't fight it
+  if(editEl) cancelEdit(false);
   const host = $('#story');
   host.replaceChildren();
   if(!weavingStarted && paragraphs.length <= 1 && !(paragraphs[0] || '').trim()){
@@ -360,7 +353,6 @@ function renderStory(){
     else if(i === weavingBlock && weavingKind === 'weave' && weavingRetro) cls += ' retro';
     else if(i === weavingBlock && weavingKind === 'ripple') cls += ' rippling';
     else cls += ' settled';
-    if(revising && i !== liveIdx) cls += ' editable';
     p.className = cls;
     p.dataset.i = i;
     if(typeof paragraphIds[i] !== 'undefined') p.dataset.id = paragraphIds[i];
@@ -370,21 +362,19 @@ function renderStory(){
   scrollToLive();
 }
 
-/* ---------- click-to-edit: revise an already-settled paragraph directly on the story ----------
+/* ---------- edit-in-place: double-click a line and type straight into it ----------
    The projector is the shared, one-and-only screen the whole room watches, so an edit made here
    is a deliberate operator action, not a per-contributor submission -- it gets its own persisted
-   identity (distinct from any phone's), separate from the crowd's live phrases. */
-const reviseToggle = $('#reviseToggle');
-const composerEl = $('#composer'), composerParaEl = $('#composerPara'), composerTextEl = $('#composerText');
-const composerSendEl = $('#composerSend'), composerCloseEl = $('#composerClose');
-
-let revising = false;       // whether settled paragraphs are currently clickable
-let editTargetId = null;    // paragraph id the composer is aimed at
-let editAfter = null;       // sentence index within it, if picked
+   identity (distinct from any phone's), separate from the crowd's live phrases.
+   The server only accepts insertions (a phrase for /submit to weave in), never a rewrite, so on
+   enter the line is diffed against its committed text: the one contiguous run of new words becomes
+   the phrase, where it was typed becomes the `after` placement hint, and a deletion means the
+   whole edit is put back with an explanation rather than half-honoured. */
+let editEl = null, editOrig = '', editTargetId = null;
 let opId = localStorage.getItem('loom_operator_id') || null;
 
-// Mirrors loom/weave.py's split_sentences -- a placement hint for tap targets, not authoritative;
-// the server independently re-derives and bounds-checks `after` against its own split at submit time.
+// Mirrors loom/weave.py's split_sentences -- a placement hint, not authoritative; the server
+// independently re-derives and bounds-checks `after` against its own split at submit time.
 function splitSentences(text){
   const out = [];
   const end = /[.!?]+["”'\)\]]*\s+/g;
@@ -394,44 +384,55 @@ function splitSentences(text){
   return out;
 }
 
-function setRevising(on){
-  revising = on;
-  reviseToggle.classList.toggle('on', on);
-  reviseToggle.textContent = on ? 'tap a line to revise it' : 'revise a line';
-  renderStory();   // reapply .editable to the current paragraphs
-  if(!on) closeComposer();
+function startEdit(p, i){
+  if(editEl) cancelEdit();
+  editEl = p; editOrig = paragraphs[i]; editTargetId = paragraphIds[i];
+  // plaintext-only keeps pasted markup out; older engines throw on it, plain true is close enough
+  try{ p.contentEditable = 'plaintext-only'; }catch{ p.contentEditable = 'true'; }
+  p.classList.add('editing');
+  p.addEventListener('keydown', editKeys);
+  p.addEventListener('blur', onEditBlur);
+  p.focus({preventScroll:true});
+  // the double-click selected a word; collapse to its end so the caret sits where they clicked
+  const sel = window.getSelection();
+  if(sel && sel.rangeCount && p.contains(sel.anchorNode)) sel.collapseToEnd();
 }
-reviseToggle.addEventListener('click', () => setRevising(!revising));
 
-function openComposer(id, text){
-  editTargetId = id; editAfter = null;
-  composerParaEl.innerHTML = '';
-  splitSentences(text).forEach((s, i) => {
-    const span = document.createElement('span');
-    span.className = 'sent'; span.textContent = s;
-    span.addEventListener('click', () => {
-      editAfter = (editAfter === i) ? null : i;
-      composerParaEl.querySelectorAll('.sent').forEach(el => el.classList.remove('picked'));
-      if(editAfter === i) span.classList.add('picked');
-    });
-    composerParaEl.append(span);
-  });
-  composerEl.classList.add('on');
-  composerTextEl.value = '';
-  composerTextEl.focus();
+function cancelEdit(rerender = true){
+  if(!editEl) return;
+  const p = editEl;
+  editEl = null; editOrig = ''; editTargetId = null;
+  p.removeEventListener('keydown', editKeys);
+  p.removeEventListener('blur', onEditBlur);
+  p.removeAttribute('contenteditable');
+  p.classList.remove('editing');
+  if(rerender) renderStory();   // restore the committed text and contributor paint
 }
-function closeComposer(){
-  composerEl.classList.remove('on');
-  editTargetId = null; editAfter = null;
+function onEditBlur(){ cancelEdit(); }
+function editKeys(e){
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); commitEdit(); }
+  else if(e.key === 'Escape'){ e.preventDefault(); cancelEdit(); }
 }
-composerCloseEl.addEventListener('click', closeComposer);
 
-async function sendEdit(){
-  const text = composerTextEl.value.trim().replace(/\s+/g, ' ');
-  if(!text || editTargetId === null) return;
-  composerSendEl.disabled = true;
-  const payload = { text, target_id: editTargetId };
-  if(editAfter !== null) payload.after = editAfter;
+async function commitEdit(){
+  if(!editEl) return;
+  const edited = editEl.textContent, orig = editOrig, targetId = editTargetId;
+  cancelEdit();   // the screen goes back to the committed text; the weave brings the change
+  // longest common prefix/suffix -> the one contiguous run that was typed in
+  let a = 0;
+  const lim = Math.min(orig.length, edited.length);
+  while(a < lim && orig[a] === edited[a]) a++;
+  let b = 0;
+  while(b < lim - a && orig[orig.length - 1 - b] === edited[edited.length - 1 - b]) b++;
+  const inserted = edited.slice(a, edited.length - b).replace(/\s+/g, ' ').trim();
+  const removed = orig.slice(a, orig.length - b).trim();
+  if(removed){ toast('the loom only weaves new words in — deleted ones were put back', 3600); return; }
+  if(!inserted) return;
+  // which sentence the phrase was typed behind, as the placement hint
+  let after = null, at = 0;
+  splitSentences(orig).forEach((s, i) => { at += s.length; if(at <= a) after = i; });
+  const payload = { text: inserted, target_id: targetId };
+  if(after !== null) payload.after = after;
   if(opId) payload.id = opId;
   try {
     const res = await fetch(`${API}/submit`, {
@@ -443,45 +444,25 @@ async function sendEdit(){
       if(j.contributor && j.contributor.id){ opId = j.contributor.id; localStorage.setItem('loom_operator_id', opId); }
       toast(j.target_applied === false
         ? (j.target_reason || 'that line changed before it landed') + ' — joined the live line instead'
-        : 'pinned into that line', 3000);
-      closeComposer();
-      setRevising(false);
+        : 'weaving it into that line', 3000);
     } else {
       toast(j.message || j.error || `couldn't send that (HTTP ${res.status})`, 3400);
     }
   } catch {
     toast('couldn\'t reach the loom', 3000);
-  } finally {
-    composerSendEl.disabled = false;
   }
 }
-composerSendEl.addEventListener('click', sendEdit);
-composerTextEl.addEventListener('keydown', e => {
-  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendEdit(); }
-});
 
-// delegated, not bound per-paragraph -- renderStory() rebuilds #story's children on every commit
-$('#story').addEventListener('click', (e) => {
-  if(!revising) return;
-  const p = e.target.closest('.para');
-  if(!p || !p.classList.contains('editable')) return;
-  const i = Number(p.dataset.i);
-  openComposer(paragraphIds[i], paragraphs[i]);
-});
-
-// double-click is always live, toggle or not -- any line opens the composer directly, the live
-// one included: early on the whole story is one live paragraph, and excluding it would leave
-// nothing editable at all
+// delegated, not bound per-paragraph -- renderStory() rebuilds #story's children on every commit.
+// The live line is editable too: early on the whole story is one live paragraph, and excluding
+// it would leave nothing editable at all.
 $('#story').addEventListener('dblclick', (e) => {
   const p = e.target.closest('.para');
-  if(!p) return;
+  if(!p || p === editEl) return;
   const i = Number(p.dataset.i);
   if(!weavingStarted) return;
   if(typeof paragraphIds[i] === 'undefined') return;
-  // a double-click also selects the word under the cursor; drop that so the composer opens clean
-  const sel = window.getSelection();
-  if(sel) sel.removeAllRanges();
-  openComposer(paragraphIds[i], paragraphs[i]);
+  startEdit(p, i);
 });
 
 /* ---------- the illustration ----------
@@ -809,11 +790,9 @@ function step(){
   }, 1700);
 }
 addEventListener('keydown', e => {
+  if(editEl) return;   // every key belongs to the line being edited — 't' must not open the lapse
   if(e.key === 't' || e.key === 'T'){ lapse.on ? closeLapse() : openLapse(); return; }
-  if(!lapse.on){
-    if(e.key === 'Escape' && composerEl.classList.contains('on')) closeComposer();
-    return;
-  }
+  if(!lapse.on) return;
   if(e.key === 'Escape') closeLapse();
   else if(e.key === ' '){ e.preventDefault(); lapse.paused = !lapse.paused; step(); }
   else if(e.key === 'ArrowRight'){ lapse.paused = true; if(lapse.i < lapse.revs.length-1){ lapse.i++; showRev(); } }
