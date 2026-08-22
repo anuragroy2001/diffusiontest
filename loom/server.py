@@ -242,6 +242,7 @@ class Loom:
         self.images: dict[int, dict] = {}          # block -> {"round": n, "data": data-uri}, client-facing
         self._image_bytes: dict[int, bytes] = {}    # block -> raw bytes, fed back for i2i continuity; never sent
         self._image_busy: set[int] = set()          # blocks with a call currently in flight
+        self._image_pending: dict[int, tuple[int, str]] = {}   # block -> newest (round, text) to run next
         self._image_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="loom-image")
 
     # ---- public API used by the HTTP handler ----
@@ -714,14 +715,20 @@ class Loom:
         return None
 
     def _maybe_illustrate(self, block: int, round_n: int, text: str) -> None:
-        """Fire a background illustration call for this round's committed text. Skipped, not queued, if
-        a call for this block is already in flight -- that call's result is about to be superseded by
-        this round's text anyway, so queuing another request would just spend a second API call on stale
-        text."""
+        """Fire a background illustration call for this round's committed text.
+
+        A call already in flight for this block does not cancel this one, it defers it: the newest
+        text is parked and run when that call returns. Dropping it outright (what this did before)
+        assumed the in-flight result would supersede this round -- but that call was started from
+        OLDER text, so it lands depicting the previous round and nothing ever illustrates this one.
+        Worst case the last round of the night is the one dropped, and the plate never catches up.
+
+        Only the newest pending text is kept -- a backlog of stale prompts is worth nothing here."""
         if not self.illustrator.enabled:
             return
         with self.lock:
             if block in self._image_busy:
+                self._image_pending[block] = (round_n, text)
                 return
             self._image_busy.add(block)
         self._image_pool.submit(self._illustrate_worker, block, round_n, text)
@@ -732,6 +739,11 @@ class Loom:
                 previous = self._image_bytes.get(block)
             result = self.illustrator.illustrate(text, previous)
             if result is None:
+                # `illustrate` swallows every failure into None. Say so out loud: an expired key or
+                # an exhausted billing cap is indistinguishable from "no images yet" otherwise, and
+                # that is not a thing to be debugging from the projector during a demo.
+                print(f"[loom] illustration failed (block {block}, round {round_n}): "
+                      f"{self.illustrator.last_error or 'unknown'}", flush=True)
                 return
             img_bytes, mime = result
             data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
@@ -744,8 +756,14 @@ class Loom:
                 self.images[block] = {"round": round_n, "data": data_uri}
             self.bus.publish({"type": "image", "round": round_n, "block": block, "data": data_uri})
         finally:
+            # Hand straight on to whatever landed while this call was out, keeping `busy` held so a
+            # concurrent commit still parks rather than starting a second call for the same block.
             with self.lock:
-                self._image_busy.discard(block)
+                nxt = self._image_pending.pop(block, None)
+                if nxt is None:
+                    self._image_busy.discard(block)
+            if nxt is not None:
+                self._image_pool.submit(self._illustrate_worker, block, nxt[0], nxt[1])
 
     def _maybe_split(self) -> None:
         """Trim the live paragraph back to what the canvas can weave, and settle the overflow behind it.

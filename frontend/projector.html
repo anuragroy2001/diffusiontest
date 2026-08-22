@@ -28,6 +28,33 @@
      Three oversized, heavily-feathered blooms on slow offset loops. This is the whole
      atmosphere; everything else sits quietly on top of it. */
   #sky{position:fixed;inset:-25%;z-index:0;pointer-events:none;filter:blur(46px);opacity:.85}
+
+  /* ---------- the warp ----------
+     Ambient thread behind the story. Sits above the cloud and under #main, so it never competes
+     with the text. Motion is transform-only -- animating stroke-dashoffset on seven viewport-wide
+     paths would repaint every frame, and this shares a machine with the denoise render. The drift
+     alternates instead of looping, so no path has to be seamlessly periodic. */
+  #warp{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+  #warp stop{stop-color:var(--thread)}
+  #warp stop.e{stop-opacity:0}
+  #warp path{fill:none;stroke:url(#warpFade);stroke-linecap:round;vector-effect:non-scaling-stroke}
+  #warp g{animation:warpdrift ease-in-out infinite alternate;will-change:transform}
+  /* Tuned for a projector, which flattens contrast -- these read stronger on a monitor than they
+     will in the hall. */
+  @keyframes warpdrift{from{transform:translate3d(0,0,0)}to{transform:translate3d(-132px,34px,0)}}
+  .w.a path{stroke-width:6;opacity:.17}     .w.a{animation-duration:58s}
+  .w.b path{stroke-width:3.2;opacity:.11}   .w.b{animation-duration:77s;animation-delay:-12s}
+  .w.c path{stroke-width:7;opacity:.18}     .w.c{animation-duration:51s;animation-delay:-27s}
+  .w.d path{stroke-width:2.6;opacity:.10}   .w.d{animation-duration:88s;animation-delay:-40s}
+  .w.e path{stroke-width:5.5;opacity:.16}   .w.e{animation-duration:66s;animation-delay:-6s}
+  .w.f path{stroke-width:2.2;opacity:.09}   .w.f{animation-duration:97s;animation-delay:-55s}
+  .w.g path{stroke-width:4.5;opacity:.14}   .w.g{animation-duration:61s;animation-delay:-33s}
+  /* Two of the seven also run the thread along itself. Only two: unlike transform, a dashoffset
+     animation repaints the path every frame, and this shares a machine with the denoise render. */
+  .w.c path,.w.e path{stroke-dasharray:520 150;animation:warpflow linear infinite}
+  .w.c path{animation-duration:34s}
+  .w.e path{animation-duration:47s;animation-direction:reverse}
+  @keyframes warpflow{from{stroke-dashoffset:0}to{stroke-dashoffset:-670}}
   #sky i{position:absolute;display:block;border-radius:50%}
   #sky i:nth-child(1){width:58vw;height:58vw;left:-6%;top:-8%;
     background:radial-gradient(circle at 40% 40%,#ffffff,rgba(214,228,247,.55) 55%,transparent 72%);
@@ -140,6 +167,9 @@
   #illus.on{display:block}
   #illus img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
     opacity:0;transition:opacity .9s ease}
+  /* the plate assembles here, then hands off to the crisp <img> underneath */
+  #illus canvas{position:absolute;inset:0;width:100%;height:100%;opacity:0;pointer-events:none;
+    transition:opacity .5s ease}
   #illus .cap{position:absolute;left:0;right:0;bottom:0;padding:9px 16px;font-family:var(--soft);
     font-weight:600;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#fff;
     background:linear-gradient(0deg,rgba(30,38,54,.55),transparent)}
@@ -152,7 +182,7 @@
   /* A band of its own above the story. It is a flex child rather than an overlay, so it reserves
      its height and the text below can never run under it. overflow stays visible so a bubble that
      is entering a round can fall out of the band and over the story as it dissolves. */
-  #float{position:relative;flex:none;height:clamp(150px,18vh,208px);z-index:5;
+  #float{position:relative;flex:none;height:clamp(186px,22vh,246px);z-index:5;
     pointer-events:none;overflow:visible}
   #bubbles{position:absolute;inset:0}
   .more{position:absolute;right:48px;bottom:6px;text-align:right}
@@ -187,6 +217,16 @@
     50%{transform:translateY(-8px) rotate(.7deg);border-radius:34px 28px 32px 30px}}
   @keyframes descend{from{opacity:0;transform:translateY(-38px) scale(.92)}to{opacity:1;transform:none}}
   .bub-wrap.going{opacity:0;transform:translate(-10px,140px) scale(.94)}
+  /* A woven phrase is not deleted, it is spent: it shrinks up into the tier above the waiting row
+     and stays there, so the band accumulates everything the room has put in. */
+  .bub-wrap.spent{width:min(206px,12.6vw);z-index:1}
+  .bub-wrap.spent .bub{font-size:11.5px;line-height:1.3;padding:9px 13px;
+    border-radius:20px 24px 18px 22px;opacity:.6;
+    box-shadow:0 1px 6px rgba(120,142,178,.10),inset 0 1px 0 rgba(255,255,255,.72),
+      0 0 0 1px color-mix(in srgb,var(--c) 24%,transparent)}
+  .bub-wrap.spent .bub b{font-size:8.5px;margin-bottom:2px}
+  .bub-wrap.spent .bub::before{width:8px;height:8px;left:12px;bottom:-6px}
+  .bub-wrap.spent .bub::after{width:5px;height:5px;left:5px;bottom:-15px}
   /* Taken by a round, but not gone yet. The server drops it from `pending` the moment the round
      starts, and removing it there gave a phrase about two seconds on screen -- long enough to look
      like the room's words were being thrown away. It holds, lit, until the round commits. */
@@ -214,6 +254,9 @@
      haunch covering only the first third. Thick at the knot, fine where it lands. The per-thread
      gradient carries the rest of the falloff, so it fades into the paragraph instead of stopping. */
   #threadG stop{stop-color:var(--thread)}
+  /* a phrase arriving flashes its thread and lets go; only a round in flight keeps one tied */
+  #threadG g.arrive{animation:arriveFade 1.9s ease-out forwards}
+  @keyframes arriveFade{0%{opacity:0}16%{opacity:1}66%{opacity:.85}100%{opacity:0}}
   #threadG .s0{stop-opacity:.9}
   #threadG .s1{stop-opacity:.16}
   .t-body{fill:none;stroke-width:1.15;stroke-linecap:round;
@@ -283,6 +326,23 @@
 
 <div id="sky"><i></i><i></i><i></i></div>
 
+<!-- The warp: the threads already on the loom, behind the cloth. Stretched to any screen with
+     preserveAspectRatio="none", and faded at both edges so none of them starts or stops on screen. -->
+<svg id="warp" aria-hidden="true" viewBox="0 0 1600 900" preserveAspectRatio="none">
+  <defs>
+    <linearGradient id="warpFade" x1="0" y1="0" x2="1" y2="0">
+      <stop class="e" offset="0"/><stop offset=".16"/><stop offset=".84"/><stop class="e" offset="1"/>
+    </linearGradient>
+  </defs>
+  <g class="w a"><path d="M-300,90 C200,10 520,190 900,110 S1500,30 2000,120"/></g>
+  <g class="w b"><path d="M-300,240 C250,150 600,340 1000,250 S1600,170 2000,260"/></g>
+  <g class="w c"><path d="M-300,400 C150,320 560,500 980,410 S1550,330 2000,420"/></g>
+  <g class="w d"><path d="M-300,560 C220,470 640,660 1050,560 S1600,480 2000,570"/></g>
+  <g class="w e"><path d="M-300,720 C180,630 580,820 990,720 S1580,640 2000,730"/></g>
+  <g class="w f"><path d="M-300,170 C300,260 700,60 1120,180 S1650,280 2000,180"/></g>
+  <g class="w g"><path d="M-300,640 C260,740 660,540 1080,650 S1620,760 2000,650"/></g>
+</svg>
+
 <header>
   <span class="wordmark"><span class="pip" id="pip"></span>The Loom</span>
   <span class="spacer"></span>
@@ -294,7 +354,7 @@
 <div id="main">
   <div id="story"></div>
   <div id="rail">
-    <div id="illus"><img id="illusA"><img id="illusB"><div class="cap" id="illusCap">the scene, as woven</div></div>
+    <div id="illus"><img id="illusA"><img id="illusB"><canvas id="illusFx"></canvas><div class="cap" id="illusCap">the scene, as woven</div></div>
     <div class="rail-h">Waiting to be woven</div>
     <div id="queuecount">the room is quiet</div>
   </div>
@@ -518,6 +578,86 @@ let evoTimer = null, evoBlock = null;
 
 function stopEvolution(){ if(evoTimer){ clearTimeout(evoTimer); evoTimer = null; } }
 
+/* ---------- plate transition ----------
+   The reference dissolve (kampos / CSS-Tricks) drives a Perlin noise map through a smoothstep
+   threshold on the GPU. No WebGL context and no dependency here, so the same idea is done on a 2D
+   canvas: the new plate is sampled into a grid of particles that drift in from a scatter and fade
+   up. The part worth copying is the WIDENED threshold -- particles are delayed by a smooth hash of
+   their own position, so the image resolves in patches like smoke clearing rather than all at once
+   or in scan order, which is what separates this from a plain fade. */
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const FX_STEP = 7, FX_DUR = 1600, FX_LIFE = 680;
+// drawn wider than the sample grid so neighbours overlap and blend — hard-edged tiles read as
+// mosaic, overlapping translucent ones read as smoke
+const FX_DRAW = FX_STEP * 1.7, FX_OFF = (FX_DRAW - FX_STEP) / 2;
+let fxRAF = 0;
+
+// deterministic per-position hash: same particle gets the same delay and scatter every time
+function hash2(x, y){
+  const v = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+  return v - Math.floor(v);
+}
+
+function particleIn(src, onDone){
+  const host = $('#illus'), cv = $('#illusFx');
+  const W = host.clientWidth, H = host.clientHeight;
+  if(REDUCED || !W || !H || !cv.getContext){ onDone(); return; }
+  const img = new Image();
+  img.onerror = () => onDone();
+  img.onload = () => {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    // cover-fit into an offscreen buffer so the sample grid matches what the <img> will show
+    const off = document.createElement('canvas');
+    off.width = W; off.height = H;
+    const octx = off.getContext('2d', {willReadFrequently: true});
+    const k = Math.max(W / img.width, H / img.height);
+    const dw = img.width * k, dh = img.height * k;
+    octx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    let data;
+    try{ data = octx.getImageData(0, 0, W, H).data; }
+    catch{ onDone(); return; }              // tainted canvas: fall back to the plain crossfade
+
+    const parts = [];
+    for(let y = 0; y < H; y += FX_STEP){
+      for(let x = 0; x < W; x += FX_STEP){
+        const i = (y * W + x) * 4;
+        const n = hash2(x * 0.11, y * 0.11);
+        const a = hash2(y * 0.07, x * 0.07) * Math.PI * 2;
+        const r = 12 + n * 44;
+        parts.push({x, y, ox: Math.cos(a) * r, oy: Math.sin(a) * r,
+                    d: n * (FX_DUR - FX_LIFE),
+                    c: `rgb(${data[i]},${data[i+1]},${data[i+2]})`});
+      }
+    }
+
+    cv.style.opacity = 1;
+    const t0 = performance.now();
+    cancelAnimationFrame(fxRAF);
+    (function frame(){
+      const e = performance.now() - t0;
+      ctx.clearRect(0, 0, W, H);
+      for(const p of parts){
+        let t = (e - p.d) / FX_LIFE;
+        if(t <= 0) continue;
+        if(t > 1) t = 1;
+        const q = 1 - Math.pow(1 - t, 3);          // ease-out: they settle rather than arrive flat
+        ctx.globalAlpha = q * 0.82;
+        ctx.fillStyle = p.c;
+        ctx.fillRect(p.x + p.ox * (1 - q) - FX_OFF, p.y + p.oy * (1 - q) - FX_OFF, FX_DRAW, FX_DRAW);
+      }
+      if(e < FX_DUR){ fxRAF = requestAnimationFrame(frame); return; }
+      ctx.globalAlpha = 1;
+      onDone();                 // reveal the crisp <img> as the canvas dissolves off it
+      cv.style.opacity = 0;
+    })();
+  };
+  img.src = src;
+}
+
 function showFrame(src, animate){
   const a = $('#illusA'), b = $('#illusB');
   const showEl = illusLayer === 'A' ? b : a, hideEl = illusLayer === 'A' ? a : b;
@@ -529,8 +669,11 @@ function showFrame(src, animate){
     requestAnimationFrame(() => { a.style.transition = ''; b.style.transition = ''; });
     return;
   }
-  showEl.onload = () => { showEl.style.opacity = 1; hideEl.style.opacity = 0; };
+  // decode now but stay hidden: the particles build the plate, the <img> takes over at the end
+  showEl.onload = null;
+  showEl.style.opacity = 0;
   showEl.src = src;
+  particleIn(src, () => { showEl.style.opacity = 1; hideEl.style.opacity = 0; });
   illusLayer = illusLayer === 'A' ? 'B' : 'A';
 }
 
@@ -541,7 +684,7 @@ function setCap(i, n){
 
 /* Loop the block's plates oldest→newest, holding longest on the current one. `start` is where to
    begin, so a plate that has just landed is shown at once rather than after a full cycle. */
-function playEvolution(block, start){
+function playEvolution(block, start, animateFirst){
   stopEvolution();
   const host = $('#illus');
   let frames = imgHist[block] || [];
@@ -556,7 +699,7 @@ function playEvolution(block, start){
   host.classList.add('on');
   evoBlock = block;
   let i = (start === undefined || start < 0 || start >= frames.length) ? frames.length - 1 : start;
-  showFrame(frames[i], false);
+  showFrame(frames[i], !!animateFirst);
   setCap(i + 1, frames.length);
   if(frames.length < 2) return;
   const step = () => {
@@ -637,7 +780,6 @@ function renderFrame(tokens){
     if(pin){ if(c.el.dataset.pin !== pin.id) c.el.dataset.pin = pin.id; }
     else if(c.el.dataset.pin !== undefined) delete c.el.dataset.pin;
   }
-  drawThreads();          // the pins just moved with the text, so re-aim every thread
 }
 
 /* ---------- the queue ---------- */
@@ -650,9 +792,34 @@ const weaving = new Set();                       // bubbles a round has taken, a
 /* A phrase leaves the screen when its round commits, not when the round starts. The server drops it
    from `pending` at round_start, so keying the bubble's life to the queue gave it about two seconds
    on screen and read as the room's words being deleted. */
+const spent = [];              // woven phrases, newest first — the room's running record
+const SPENT_MAX = 14;
+
+/* Spent bubbles are laid out newest-first, so every commit nudges the whole tier along. The
+   top/left transition turns that reshuffle into drift rather than a jump. */
+function placeSpent(){
+  const H = $('#bubbles').offsetHeight || 200;
+  spent.forEach((el, i) => {
+    el.style.left = (1.4 + (i % 7) * 13.9) + '%';
+    el.style.top  = (13 + Math.floor(i / 7) * 34) + 'px';
+  });
+  return H;
+}
+
 function releaseWeaving(){
-  weaving.forEach(w => { w.classList.add('going'); setTimeout(() => w.remove(), 900); });
+  weaving.forEach(w => {
+    // the same element, re-ranked: reusing it lets the shrink and the move animate as one gesture
+    w.classList.remove('weaving');
+    w.classList.add('spent');
+    spent.unshift(w);
+  });
+  while(spent.length > SPENT_MAX){
+    const old = spent.pop();
+    old.classList.add('going');
+    setTimeout(() => old.remove(), 900);
+  }
   weaving.clear();
+  placeSpent();
   drawThreads();
 }
 
@@ -678,17 +845,33 @@ function threadPath(x1, y1, x2, y2, bow){
   return `M${n(x1)},${n(y1)} C${n(x1 + bow)},${n(y1 + k)} ${n(x2 - bow)},${n(y2 - k)} ${n(x2)},${n(y2)}`;
 }
 
+/* Threads used to be re-aimed from renderFrame. The bootstrap round -- the very first prompt -- is a
+   plain completion, not a canvas denoise: it publishes round_start and commit with no `pins` and no
+   `frame` between them, so that hook never fired and the first phrase of the night got no thread at
+   all. Driving it from rAF instead also keeps a thread attached to its bubble while the bubble bobs,
+   which per-frame aiming could not. The loop only runs while something is actually tied on. */
+let threadRAF = 0;
+function startThreads(){
+  drawThreads();                // draw now; the loop only keeps it aimed afterwards
+  if(!threadRAF) threadRAF = requestAnimationFrame(function step(){
+    drawThreads();
+    threadRAF = (weaving.size || arriving.size) ? requestAnimationFrame(step) : 0;
+  });
+}
+
+const arriving = new Map();     // key -> bubble, for the flash a phrase makes as it lands
+
 function drawThreads(){
   document.body.classList.toggle('weaving', weaving.size > 0);
   const live = new Set();
-  for(const w of weaving){
+  for(const w of new Set([...weaving, ...arriving.values()])){
     const key = w.dataset.key || '';
     if(!key || w.classList.contains('going')) continue;
     const b = w.getBoundingClientRect();
     if(!b.width) continue;
     // aim at the phrase's own pinned run; before the first frame lands, at the paragraph itself
     const pin = document.querySelector(`.tk.pin[data-pin="${esc(key.split('|')[0])}"]`);
-    const host = pin || weavingEl();
+    const host = pin || weavingEl() || liveEl();
     if(!host) continue;
     const t = host.getBoundingClientRect();
     if(!t.width && !t.height) continue;
@@ -697,6 +880,7 @@ function drawThreads(){
     const x2 = t.left + t.width / 2,  y2 = t.top + t.height / 2;
     const d = threadPath(x1, y1, x2, y2, bowOf(key));
     let g = threadG.querySelector(`g[data-key="${esc(key)}"]`);
+    const flash = !weaving.has(w);
     if(!g){
       g = document.createElementNS(SVGNS, 'g');
       g.dataset.key = key;
@@ -720,6 +904,7 @@ function drawThreads(){
       }
       threadG.append(g);
     }
+    g.classList.toggle('arrive', flash);
     const grad = g.firstElementChild;
     grad.setAttribute('x1', x1.toFixed(1)); grad.setAttribute('y1', y1.toFixed(1));
     grad.setAttribute('x2', x2.toFixed(1)); grad.setAttribute('y2', y2.toFixed(1));
@@ -755,21 +940,34 @@ function renderQueue(pending){
 
   show.forEach((p, i) => {
     const k = keyOf(p);
+    const who = contributors[p.contributor];
+    // Re-read the colour every pass, not just at creation. A `queue` event carries no contributors
+    // map, so the very first phrase of the night arrives before the client has ever heard of the
+    // person who sent it -- set once, that bubble would stay placeholder grey for good.
+    const c = (who && who.colour) || '#b9c7dc';
+    const name = (who && who.name) || '';
     let el = bubbles.get(k);
     if(!el){
-      const c = (contributors[p.contributor] && contributors[p.contributor].colour) || '#b9c7dc';
-      const name = (contributors[p.contributor] && contributors[p.contributor].name) || '';
       el = document.createElement('div');
       el.className = 'bub-wrap'; el.dataset.text = p.text; el.dataset.key = k;
       const b = document.createElement('div');
-      b.className = 'bub'; b.style.setProperty('--c', c);
-      if(name){ const n = document.createElement('b'); n.textContent = name; b.append(n); }
+      b.className = 'bub';
       b.append(document.createTextNode(p.text));
       el.append(b); host.append(el);
       bubbles.set(k, el);
+      // the moment a phrase lands, it reaches for the story it is going to join
+      arriving.set(k, el);
+      setTimeout(() => { arriving.delete(k); }, 1900);
+      startThreads();
     }
+    const bub = el.firstElementChild;
+    bub.style.setProperty('--c', c);
+    let tag = bub.querySelector('b');
+    if(name && !tag){ tag = document.createElement('b'); bub.prepend(tag); }
+    if(tag) tag.textContent = name;
+    const H = host.offsetHeight || 200;
     el.style.left = (BAND_X + i * BAND_GAP) + '%';
-    el.style.top  = (86 - i * 15) + 'px';
+    el.style.top  = (H - 104 - i * 14) + 'px';
   });
 
   const extra = pending.length - show.length;
@@ -858,14 +1056,19 @@ function connect(){
         renderStory();
         showIllus(liveIdx, false);
         // the phrases entering this round leave the rail
-        const entering = new Set((d.submissions || []).map(s => s.text));
+        const entering = new Map((d.submissions || []).map(s => [s.text, s.colour]));
         document.querySelectorAll('.bub-wrap').forEach(w => {
           if(!entering.has(w.dataset.text) || w.classList.contains('weaving')) return;
+          // round_start is the first event that ever carries this contributor's colour, and no
+          // `queue` follows to re-render the bubble — paint it here or the first phrase of the
+          // night keeps the placeholder grey it was created with.
+          const c = entering.get(w.dataset.text);
+          if(c) w.firstElementChild.style.setProperty('--c', c);
           w.classList.add('weaving');       // lit and held — it leaves when the round commits
           bubbles.delete(w.dataset.key);
           weaving.add(w);
         });
-        drawThreads();
+        startThreads();
         $('#meta').textContent = d.retro
           ? `round ${d.round} · revising an earlier line`
           : `round ${d.round} · ${d.kind}`;
@@ -922,7 +1125,8 @@ function connect(){
         images[d.block] = {round: d.round, data};
         pushPlate(d.block, data);
         // show the new plate at once, then carry on looping from there
-        if(d.block === liveIdx) playEvolution(liveIdx, (imgHist[liveIdx] || []).length - 1);
+        // a plate that has just landed assembles in, rather than snapping into place
+        if(d.block === liveIdx) playEvolution(liveIdx, (imgHist[liveIdx] || []).length - 1, true);
         break;
       }
 
@@ -959,7 +1163,7 @@ connect();
 
 // the band is fixed but the story scrolls under it, so a live thread has to be re-aimed
 $('#story').addEventListener('scroll', queueThreads, {passive:true});
-addEventListener('resize', queueThreads);
+addEventListener('resize', () => { placeSpent(); queueThreads(); });
 
 /* ---------- the close: scrub the whole weave ---------- */
 let lapse = {on:false, revs:[], i:0, timer:null, paused:false};
