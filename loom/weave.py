@@ -91,11 +91,19 @@ class Tokenizer:
 OUTLINE = re.compile(r"^\s*[*\-]\s{2,}|\*\s+\*", re.M)
 META = re.compile(r"the user|Constraint:|Self-Correction|the prompt|\bWait\b|didn't (?:actually )?provide")
 CHANNEL = re.compile(r"<\|channel>(?:thought)?\s*|<channel\|>")
+# The loom's own words to the model, echoed back into the canvas. These end in sentence punctuation,
+# so every "keep whole sentences" trim waves them through -- they have to be removed by name, and
+# removed rather than cut at, because the model can echo them ahead of perfectly good prose.
+# Mirrors SYSTEM and the user turn in loom/server.py; keep the two in sync.
+ECHO = re.compile(r"(?i)(?:you are a )?prose continuation engine\.?|\bprose only\b\.?"
+                  r"|\bcontinue the story\b\.?")
 
 
 def tidy(text: str) -> str:
-    """Strip channel markers and cut the text at the first line that stops being story."""
+    """Strip channel markers and echoed prompt text, and cut at the first line that stops being story."""
     text = CHANNEL.sub("", text)
+    if ECHO.search(text):
+        text = re.sub(r" {2,}", " ", ECHO.sub("", text))
     cut = len(text)
     for rx in (OUTLINE, META):
         m = rx.search(text)

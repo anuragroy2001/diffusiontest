@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from illustrate import Illustrator  # noqa: E402
-from weave import Policy, Submission, Tokenizer, plan_weave, split_sentences, tidy  # noqa: E402
+from weave import ECHO, Policy, Submission, Tokenizer, plan_weave, split_sentences, tidy  # noqa: E402
 
 DG_API   = os.environ.get("DG_API", "http://100.70.13.60:8080")
 PORT     = int(os.environ.get("LOOM_PORT", "8082"))
@@ -92,11 +92,22 @@ def _bootstrap_prose(raw: str) -> str:
     bulleted line, not before it. Confirmed live: with room to finish (max_tokens=512), good prose
     consistently follows the outline. Markdown emphasis asterisks around that prose are stripped, and
     the result is trimmed to the last complete sentence so a token-limit cutoff mid-clause doesn't ship."""
+    # The model sometimes quotes the prompt back ("Continue the story. Prose continuation engine.
+    # Prose only."); those echoes end in "." and would survive the last-complete-sentence trim
+    # below, so they go first.
+    raw = re.sub(r" {2,}", " ", ECHO.sub("", raw))
     matches = list(_BOOTSTRAP_BULLET.finditer(raw))
     tail = raw[matches[-1].end():] if matches else raw
     tail = tail.replace("*", "").strip()
     end = max((tail.rfind(c) for c in ".!?"), default=-1)
     return tail[:end + 1].strip() if end >= 0 else ""
+
+
+def _punctuate(phrase: str) -> str:
+    """A phrase landing verbatim stands as its own sentence. Without terminal punctuation it fuses
+    into whatever follows -- "he fights the enemy king was waiting"."""
+    phrase = phrase.rstrip()
+    return phrase if phrase[-1:] in '.!?"”…' else phrase + "."
 
 
 def _sentence_at(text: str, pos: int) -> int:
@@ -220,9 +231,11 @@ class Loom:
         self.pending: deque[Pending] = deque()
         self.contributors: dict[str, Contributor] = {}
         self.history: list[Revision] = []
-        # Every phrase the room has ever landed. Re-pinned on later rounds so a rewrite of the sentence
-        # holding someone's words cannot quietly delete them.
-        self.absorbed: set[str] = set()
+        # Every phrase the room has ever landed, mapped to the contributor who threw it in. Re-pinned
+        # on later rounds so a rewrite of the sentence holding someone's words cannot quietly delete
+        # them -- and served in /state as the projector's phrase book, so attribution survives a
+        # reload instead of living only in whichever browser happened to witness the landing round.
+        self.absorbed: dict[str, str] = {}
         self.round = 0
         self.ripple: deque[int] = deque()        # paragraphs waiting to absorb a change made before them
         # Paragraph index -> sentence index of a fresh verbatim insert. Read once by the next ripple on
@@ -343,13 +356,11 @@ class Loom:
                                          seed=0, kind="edit", retro=idx != self.live,
                                          submissions=[{"text": text, "contributor": contributor.id}]))
             if pure_insert:
-                self.absorbed.add(inserted)
-                self.smooth[idx] = _sentence_at(text, a)
-                if idx not in self.ripple:
-                    self.ripple.appendleft(idx)   # blend the seam before the downstream cascade
-            for i in range(idx + 1, len(self.paragraphs)):
-                if i not in self.ripple:
-                    self.ripple.append(i)
+                self._absorb_verbatim(idx, inserted, contributor.id, a)
+            else:
+                for i in range(idx + 1, len(self.paragraphs)):
+                    if i not in self.ripple:
+                        self.ripple.append(i)
             block = idx
         # A dedicated event, not a `commit`: the projector treats `commit` as the end of a round and
         # clears its weaving state, but an edit can land while a round is streaming a different block.
@@ -357,6 +368,21 @@ class Loom:
         self._maybe_illustrate(block, n, text)
         self.last_round = time.time()
         return {"edited": True, "block": block, "smoothing": pure_insert}
+
+    def _absorb_verbatim(self, idx: int, phrase: str, contributor: str, seam_at: int) -> None:
+        """Record a phrase that landed verbatim; the caller holds the lock and has already written
+        the paragraph text. One path for every verbatim landing (operator inserts, spliced phrases,
+        the bootstrap seed): the phrase is protected on every future round and attributed to its
+        contributor, the sentence holding the seam is remembered, and the smoothing ripple plus the
+        downstream cascade are queued. Bootstrap used to hand-roll part of this and skipped the
+        ripple, which is why its seed phrase stayed fused to the continuation."""
+        self.absorbed[phrase] = contributor
+        self.smooth[idx] = _sentence_at(self.paragraphs[idx], seam_at)
+        if idx not in self.ripple:
+            self.ripple.appendleft(idx)   # blend the seam before the downstream cascade
+        for i in range(idx + 1, len(self.paragraphs)):
+            if i not in self.ripple:
+                self.ripple.append(i)
 
     def _splice(self, p: Pending) -> None:
         """A phrase that failed MAX_TRIES weave rounds lands verbatim instead — the same inclusion-by-
@@ -370,17 +396,11 @@ class Loom:
             at = len(sents) - 1 if p.after is None else max(-1, min(p.after, len(sents) - 1))
             head = "".join(sents[:at + 1]).rstrip()
             tail = "".join(sents[at + 1:]).lstrip()
-            text = " ".join(part for part in (head, p.text, tail) if part)
+            text = " ".join(part for part in (head, _punctuate(p.text), tail) if part)
             self.round += 1
             n = self.round
             self.paragraphs[idx] = text
-            self.absorbed.add(p.text)
-            self.smooth[idx] = _sentence_at(text, len(head) + 1 if head else 0)
-            if idx not in self.ripple:
-                self.ripple.appendleft(idx)
-            for i in range(idx + 1, len(self.paragraphs)):
-                if i not in self.ripple:
-                    self.ripple.append(i)
+            self._absorb_verbatim(idx, p.text, p.contributor, len(head) + 1 if head else 0)
             self.history.append(Revision(n=n, at=time.time(), block=idx, before=before, after=text,
                                          seed=0, kind="splice", retro=idx != self.live,
                                          submissions=[{"text": p.text, "contributor": p.contributor}]))
@@ -403,6 +423,9 @@ class Loom:
                 "busy": self.busy,
                 "pending": [p.as_json() for p in self.pending],
                 "contributors": {k: v.as_json() for k, v in self.contributors.items()},
+                # the permanent phrase book: every landed phrase with its owner, so a projector can
+                # rebuild attribution from scratch instead of needing to have witnessed each landing
+                "absorbed": [{"text": t, "contributor": c} for t, c in self.absorbed.items()],
                 "max_per_round": MAX_PER_ROUND,
                 "images": dict(self.images),
             }
@@ -430,7 +453,14 @@ class Loom:
                 elif self.ripple:
                     with self.lock:
                         block = self.ripple.popleft()
-                    self._run_round([], kind="ripple", block=block)
+                        hinted = block in self.smooth
+                    # A cascade entry with no seam to smooth is drained without a round: with every
+                    # sentence protected or pinned the model could only reproduce the paragraph --
+                    # or extend a settled one past what the canvas can hold -- and forcing it to
+                    # rewrite an arbitrary sentence instead was where a third of rounds died
+                    # (loom/docs/progress.md). Only seam-smoothing ripples spend a generation.
+                    if hinted:
+                        self._run_round([], kind="ripple", block=block)
                 else:
                     time.sleep(0.25)
             except Exception as e:                     # a bad round must never kill the loom
@@ -505,8 +535,9 @@ class Loom:
             self.round += 1
             n = self.round
 
-        phrases = [p.text for p in batch]
-        seed_text = " ".join(phrases)
+        # Each phrase punctuated into its own sentence, or the first one fuses straight into the
+        # continuation: "a knight enters the battlefield Sir Alistair stepped into the churn".
+        seed_text = " ".join(_punctuate(p.text) for p in batch)
         seed = 1000 + n
         continuation = ""
         # One retry on a different seed: ~20% of opens come back with no sentence-ending punctuation
@@ -546,7 +577,9 @@ class Loom:
             self.started = True
             for p in batch:
                 if p.text in after:
-                    self.absorbed.add(p.text)
+                    # the full verbatim-landing treatment: protection plus a smoothing ripple over
+                    # the seam where the continuation begins
+                    self._absorb_verbatim(0, p.text, p.contributor, max(0, len(seed_text) - 1))
             self.history.append(Revision(n=n, at=time.time(), block=0, before="", after=after,
                                          seed=seed, kind="bootstrap", spans=spans,
                                          submissions=[{"text": p.text, "contributor": p.contributor}
@@ -571,12 +604,11 @@ class Loom:
 
         subs = [Submission(text=p.text, id=p.contributor, after=p.after) for p in batch]
         protect = tuple(t for t in self.absorbed if t in before)  # nobody's phrase gets deleted
-        # A ripple round has nothing new to weave, so it would reproduce the paragraph verbatim -- give
-        # it a sentence to rewrite instead. A fresh verbatim insert leaves a seam hint, and the ripple
-        # dissolves the seam's neighbours so the blending happens where the operator just typed --
-        # plan_weave refuses to dissolve the protected sentence itself. Otherwise the sentence comes
-        # from the round number rather than at random: the revision log has to replay exactly for the
-        # time-lapse at the end.
+        # A ripple only runs to blend a seam a verbatim landing just left -- the worker drains
+        # hintless cascade entries without a round. Dissolve the seam's neighbours so the blending
+        # happens where the text just changed; plan_weave refuses to dissolve the protected sentence
+        # itself. The round-number fallback covers a seam with no usable neighbours, and is
+        # deterministic because the revision log has to replay exactly for the time-lapse at the end.
         dissolve: tuple[int, ...] = ()
         if not subs:
             n_sents = len(split_sentences(before))
@@ -585,8 +617,6 @@ class Loom:
             if hint is not None and n_sents > 1:
                 dissolve = tuple(i for i in (hint - 1, hint + 1) if 0 <= i < n_sents) \
                            or (n % n_sents,)
-            elif n_sents > 1:
-                dissolve = (n % n_sents,)
         plan = plan_weave(before, subs, self.tok, Policy(), protect=protect, dissolve=dissolve)
         seed = 1000 + n
 
@@ -635,7 +665,7 @@ class Loom:
                 self.started = True
                 for p in batch:
                     if p.text in after:
-                        self.absorbed.add(p.text)
+                        self.absorbed[p.text] = p.contributor
                 rev = Revision(n=n, at=time.time(), block=target, before=before, after=after, seed=seed,
                                kind=kind, retro=retro, spans=spans,
                                submissions=[{"text": p.text, "contributor": p.contributor} for p in batch])
@@ -687,6 +717,10 @@ class Loom:
                 return f"only {kept}/{len(story)} pinned spans survived"
         elif not text.strip():
             return "empty canvas"
+        if ECHO.search(text):
+            # tidy() scrubs these; this is the backstop for any path that skirts it, because an
+            # echo that commits gets pinned as story on every round after.
+            return "the prompt echoed into the story"
         run = self._copied_run(text, target, before)
         if run:
             return f"copied a passage: {run[:60]!r}"

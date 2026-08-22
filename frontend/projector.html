@@ -378,6 +378,9 @@ let weavingStarted = false;
 // ripple re-absorbing one. Conflating them under one `.live` treatment would make all three look the
 // same on screen.
 let weavingBlock = null, weavingKind = null, weavingRetro = false;
+// whether the current round carries the room's phrases — a rejected housekeeping ripple is not
+// worth announcing, but a rejected round someone watched their bubble enter is
+let weavingHadSubs = false;
 const weavingEl = () => $(`.para[data-i="${weavingBlock}"]`);
 
 function renderStory(){
@@ -797,10 +800,14 @@ function toast(msg, ms = 3600){
 /* ---------- absorbing a snapshot ---------- */
 function applyState(s){
   contributors = s.contributors || {};
+  // the server's permanent phrase book — every phrase the room ever landed, with its owner.
+  // Learned here so attribution survives reloads and rounds this projector never witnessed;
+  // before, /state carried only pending phrases and a refresh forgot every landed marking.
+  for(const a of (s.absorbed || [])) learn(a.text, a.contributor);
   paragraphs = s.paragraphs || [];
   paragraphIds = s.paragraph_ids || [];
   liveIdx = s.live || 0;
-  weavingBlock = null; weavingKind = null; weavingRetro = false;
+  weavingBlock = null; weavingKind = null; weavingRetro = false; weavingHadSubs = false;
   images = s.images || {};
   // A reconnect replays state with only the newest plate per block; seed from it only where this
   // projector has no history of its own, so a dropped connection does not erase the evolution.
@@ -849,6 +856,7 @@ function connect(){
       case 'round_start': {
         weavingStarted = true;
         weavingBlock = d.block; weavingKind = d.kind; weavingRetro = !!d.retro;
+        weavingHadSubs = (d.submissions || []).length > 0;
         for(const s of (d.submissions || [])){
           if(s.colour && s.contributor && !contributors[s.contributor])
             contributors[s.contributor] = {id:s.contributor, name:'', colour:s.colour};
@@ -893,7 +901,7 @@ function connect(){
         paragraphs[d.block] = d.text;
         const flashLanding = !!d.retro;
         releaseWeaving();
-        weavingBlock = null; weavingKind = null; weavingRetro = false;
+        weavingBlock = null; weavingKind = null; weavingRetro = false; weavingHadSubs = false;
         resetCanvas();
         renderStory();
         if(flashLanding){
@@ -929,11 +937,15 @@ function connect(){
       case 'round_rejected': {
         const el = $(`.para[data-i="${d.block}"]`);
         if(el){ el.classList.add('rejected'); setTimeout(()=>el.classList.remove('rejected'), 1600); }
-        toast('the loom let that one go', 2600);
+        // only a round the room saw begin earns a centre-stage toast — a rejected housekeeping
+        // ripple announcing itself just reads as failure. The reason goes to the corner instead,
+        // where the operator can see what the loom objected to.
+        if(weavingHadSubs) toast('the loom let that one go', 2600);
+        $('#meta').textContent = `round ${d.round} · let go` + (d.reason ? ` — ${d.reason}` : '');
         // the server puts these phrases back at the head of the queue, so clear the held bubbles
         // outright and let the next `queue` event build them again in their restored places
         weaving.forEach(w => w.remove()); weaving.clear(); drawThreads();
-        weavingBlock = null; weavingKind = null; weavingRetro = false;
+        weavingBlock = null; weavingKind = null; weavingRetro = false; weavingHadSubs = false;
         resetCanvas();
         renderStory();
         break;
