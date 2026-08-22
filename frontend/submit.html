@@ -2,45 +2,137 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>The Loom — throw in a phrase</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,300;0,400;0,600;0,700;1,400&family=Quicksand:wght@400;500;600;700&display=swap">
 <style>
   :root{
-    --bg:#0b0d11; --panel:#161a21; --line:#2a303c; --fg:#e8ebf1; --dim:#8b93a1;
-    --accent:#7aa2f7; --ok:#7ec699; --bad:#f07178;
-    font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    /* same cloud the projector is painted on */
+    --cloud-0:#fbfcfe; --cloud-1:#f1f4fa; --cloud-2:#e7edf7; --cloud-3:#dae3f0;
+    --mist:#b9c7dc; --ink:#333f52; --ink-2:#6c7c93; --ink-3:#93a2b8;
+    --warn:#d98a90;
+    /* the contributor colour, once the loom has assigned one — the page wears it */
+    --c:#9fb4d0;
+
+    --story:'Nunito','Segoe UI',system-ui,-apple-system,sans-serif;
+    --soft:'Quicksand','Nunito','Segoe UI',system-ui,sans-serif;
   }
   *{box-sizing:border-box}
-  body{margin:0;min-height:100dvh;background:var(--bg);color:var(--fg);
-    display:flex;flex-direction:column;align-items:center;padding:24px 16px 48px}
-  .wrap{width:100%;max-width:420px;display:flex;flex-direction:column;gap:14px}
-  h1{font-size:20px;margin:6px 0 0}
-  p.sub{margin:0;color:var(--dim);font-size:13px}
-  label{font-size:13px;color:var(--dim);display:block;margin-bottom:5px}
-  textarea,input[type=text]{width:100%;font:16px/1.4 inherit;color:var(--fg);background:var(--panel);
-    border:1px solid var(--line);border-radius:10px;padding:12px;outline:none;resize:vertical}
-  textarea{min-height:88px}
-  textarea:focus,input:focus{border-color:var(--accent)}
-  .count{font-size:11px;color:var(--dim);text-align:right;margin-top:3px}
-  .count.over{color:var(--bad)}
-  button{width:100%;padding:14px;font:16px/1 inherit;font-weight:600;color:#0b0d11;
-    background:var(--accent);border:none;border-radius:10px;cursor:pointer}
-  button:active{transform:scale(.99)}
-  button:disabled{opacity:.5;cursor:default}
-  .msg{border-radius:10px;padding:12px 14px;font-size:14px;display:none;gap:10px;align-items:center}
-  .msg.show{display:flex}
-  .msg.ok{background:#132a1e;border:1px solid #1f4c33;color:var(--ok)}
-  .msg.err{background:#2a1416;border:1px solid #5a2c30;color:var(--bad)}
-  .swatch{width:20px;height:20px;border-radius:50%;flex:none;border:1px solid rgba(255,255,255,.25)}
-  .field-err{color:var(--bad);font-size:12px;margin-top:4px;display:none}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;min-height:100dvh;background:var(--cloud-1);color:var(--ink);
+    font:400 16px/1.55 var(--story);-webkit-font-smoothing:antialiased;
+    display:flex;flex-direction:column;align-items:center;
+    padding:max(26px,env(safe-area-inset-top)) 18px max(40px,env(safe-area-inset-bottom))}
+
+  /* ---------- the same drifting cloud field, two blooms instead of three on a phone ---------- */
+  #sky{position:fixed;inset:-30%;z-index:0;pointer-events:none;filter:blur(44px);opacity:.9}
+  #sky i{position:absolute;display:block;border-radius:50%}
+  #sky i:nth-child(1){width:96vw;height:96vw;left:-22%;top:-14%;
+    background:radial-gradient(circle at 42% 42%,#fff,rgba(214,228,247,.6) 54%,transparent 72%);
+    animation:drift1 78s ease-in-out infinite}
+  #sky i:nth-child(2){width:108vw;height:108vw;right:-30%;bottom:-18%;
+    background:radial-gradient(circle at 52% 48%,#fff,rgba(240,229,247,.5) 52%,transparent 70%);
+    animation:drift2 96s ease-in-out infinite}
+  @keyframes drift1{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(9vw,6vh,0) scale(1.13)}}
+  @keyframes drift2{0%,100%{transform:translate3d(0,0,0) scale(1.05)}50%{transform:translate3d(-8vw,-6vh,0) scale(.95)}}
+
+  .wrap{position:relative;z-index:1;width:100%;max-width:430px;display:flex;flex-direction:column;gap:16px}
+
+  /* ---------- masthead ---------- */
+  h1{font-family:var(--soft);font-weight:600;font-size:19px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--ink-2);margin:2px 0 0;display:flex;align-items:center;gap:11px}
+  h1 .pip{width:9px;height:9px;border-radius:50%;background:var(--c);
+    box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 55%,transparent);
+    animation:breathe 3.4s ease-in-out infinite}
+  @keyframes breathe{0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 50%,transparent)}
+    50%{box-shadow:0 0 0 9px transparent}}
+  p.sub{margin:0;color:var(--ink-3);font-size:15.5px;line-height:1.5;font-weight:400}
+
+  /* ---------- "you are this colour" ---------- */
+  .whoami{align-items:center;gap:10px;font-family:var(--soft);font-weight:600;font-size:14px;
+    color:var(--ink-2);background:rgba(255,255,255,.8);align-self:flex-start;
+    padding:10px 17px 10px 13px;border-radius:24px 26px 22px 25px;
+    box-shadow:0 2px 9px rgba(120,142,178,.10),inset 0 1px 0 #fff,
+      0 0 0 1px color-mix(in srgb,var(--c) 22%,transparent)}
+  .swatch{width:20px;height:20px;border-radius:50%;flex:none;background:var(--c);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 0 0 3px color-mix(in srgb,var(--c) 16%,transparent)}
+  .whoami .swatch{width:15px;height:15px}
+
+  /* ---------- the card ---------- */
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.95),rgba(255,255,255,.72));
+    border-radius:30px;padding:22px 20px;
+    box-shadow:0 3px 16px rgba(120,142,178,.10),0 20px 54px rgba(120,142,178,.13),
+      inset 0 1px 0 rgba(255,255,255,.92)}
+  label{font-family:var(--soft);font-weight:600;font-size:12.5px;letter-spacing:.13em;
+    text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:8px}
+  textarea,input[type=text]{width:100%;font:400 16px/1.5 var(--story);color:var(--ink);
+    background:var(--cloud-1);border:1.5px solid transparent;border-radius:19px;
+    padding:14px 16px;outline:none;resize:none;
+    transition:border-color .25s ease,background .25s ease,box-shadow .25s ease}
+  textarea{min-height:104px}
+  textarea::placeholder,input::placeholder{color:var(--ink-3);opacity:.75}
+  textarea:focus,input[type=text]:focus{background:#fff;border-color:color-mix(in srgb,var(--c) 42%,transparent);
+    box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 13%,transparent)}
+  .count{font-family:var(--soft);font-weight:600;font-size:12px;color:var(--ink-3);
+    text-align:right;margin-top:7px}
+  .count.over{color:var(--warn)}
+  .field-err{color:var(--warn);font-size:13.5px;margin-top:7px;display:none}
   .field-err.show{display:block}
-  .whoami{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
-  .whoami .swatch{width:12px;height:12px}
+  .row2{margin-top:18px}
+
+  /* ---------- the button, shaped like the bubble it becomes ---------- */
+  button{width:100%;margin-top:20px;padding:17px;cursor:pointer;
+    font-family:var(--soft);font-weight:700;font-size:16.5px;letter-spacing:.03em;color:#fff;
+    background:color-mix(in srgb,var(--c) 80%,#3a4658);border:none;
+    border-radius:26px 30px 24px 28px;
+    box-shadow:0 3px 12px color-mix(in srgb,var(--c) 26%,transparent),
+      0 12px 28px rgba(120,142,178,.16),inset 0 1px 0 rgba(255,255,255,.28);
+    transition:transform .18s ease,box-shadow .25s ease,opacity .2s ease}
+  button:active{transform:scale(.985) translateY(1px)}
+  button:disabled{opacity:.55;cursor:default}
+  :focus-visible{outline:2.5px solid color-mix(in srgb,var(--c) 65%,transparent);outline-offset:3px}
+
+  /* ---------- what came back ---------- */
+  .msg{border-radius:24px 27px 23px 26px;padding:15px 19px;font-size:15px;line-height:1.45;
+    display:none;gap:12px;align-items:center;font-family:var(--soft);font-weight:600}
+  .msg.show{display:flex}
+  .msg.ok{background:rgba(255,255,255,.9);color:var(--ink-2);
+    box-shadow:0 2px 10px rgba(120,142,178,.10),inset 0 1px 0 #fff,
+      0 0 0 1px color-mix(in srgb,var(--c) 20%,transparent)}
+  .msg.err{background:rgba(255,246,246,.94);color:#9c5b60;
+    box-shadow:0 2px 10px rgba(178,120,130,.10),inset 0 1px 0 #fff,0 0 0 1px rgba(217,138,144,.24)}
+
+  /* ---------- the phrase leaves as a bubble ----------
+     The same object the projector floats in its queue rail, so the thing that lifts out of your
+     hand here is the thing you then watch on the big screen. */
+  .launch{position:fixed;left:50%;bottom:22vh;z-index:5;transform:translateX(-50%);
+    max-width:min(330px,80vw);pointer-events:none;
+    font-family:var(--soft);font-weight:600;font-size:15.5px;line-height:1.4;color:#3f4b5e;
+    padding:17px 23px;border-radius:30px 34px 28px 32px;
+    background:linear-gradient(155deg,rgba(255,255,255,.96),color-mix(in srgb,var(--c) 17%,rgba(255,255,255,.72)));
+    box-shadow:0 2px 10px rgba(120,142,178,.12),0 14px 34px rgba(120,142,178,.14),
+      inset 0 1px 0 rgba(255,255,255,.95),0 0 0 1px color-mix(in srgb,var(--c) 22%,transparent);
+    animation:lift 2.3s cubic-bezier(.3,.9,.35,1) forwards}
+  @keyframes lift{
+    0%{opacity:0;transform:translateX(-50%) translateY(34px) scale(.9)}
+    18%{opacity:1;transform:translateX(-50%) translateY(0) scale(1)}
+    100%{opacity:0;transform:translateX(-50%) translateY(-46vh) scale(.97) rotate(-2deg)}}
+
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;
+      transition-duration:.01ms !important}
+    .launch{display:none}
+  }
 </style>
 </head>
 <body>
+
+<div id="sky"><i></i><i></i></div>
+
 <div class="wrap">
-  <h1>The Loom</h1>
+  <h1><span class="pip"></span>The Loom</h1>
   <p class="sub">Throw a phrase into the room's story. Weird is good.</p>
 
   <div class="whoami" id="whoami" style="display:none">
@@ -49,21 +141,21 @@
   </div>
 
   <form id="form">
-    <div>
-      <label for="text">your phrase</label>
-      <textarea id="text" maxlength="240" placeholder="a stolen accordion…" autofocus></textarea>
-      <div class="count" id="textCount">0 / 120</div>
-      <div class="field-err" id="textErr"></div>
+    <div class="card">
+      <div>
+        <label for="text">Your phrase</label>
+        <textarea id="text" maxlength="240" placeholder="a stolen accordion…" autofocus></textarea>
+        <div class="count" id="textCount">0 / 120</div>
+        <div class="field-err" id="textErr"></div>
+      </div>
+      <div class="row2">
+        <label for="name">Name (optional)</label>
+        <input type="text" id="name" maxlength="48" placeholder="Ada">
+        <div class="count" id="nameCount">0 / 24</div>
+        <div class="field-err" id="nameErr"></div>
+      </div>
     </div>
-    <div style="margin-top:12px">
-      <label for="name">name (optional)</label>
-      <input type="text" id="name" maxlength="48" placeholder="Ada">
-      <div class="count" id="nameCount">0 / 24</div>
-      <div class="field-err" id="nameErr"></div>
-    </div>
-    <div style="margin-top:16px">
-      <button type="submit" id="submitBtn">throw it in</button>
-    </div>
+    <button type="submit" id="submitBtn">Throw it in</button>
   </form>
 
   <div class="msg" id="msg"></div>
@@ -71,8 +163,12 @@
 
 <script>
 // Backend base URL. Per frontend-spec.md this LAN/Tailscale IP can change on server restart —
-// the server prints the new one on startup. Edit this one constant if it does.
-const API = "http://192.168.100.69:8082";
+// the server prints the new one on startup. Override without editing the file by opening
+// ?api=http://<ip>:8082 once; the choice sticks on this device, same as the projector page.
+const API = (new URLSearchParams(location.search).get('api')
+          || localStorage.getItem('loom_api')
+          || "http://192.168.100.69:8082").replace(/\/+$/, '');
+localStorage.setItem('loom_api', API);
 
 const $ = s => document.querySelector(s);
 const textEl = $('#text'), nameEl = $('#name'), form = $('#form'), submitBtn = $('#submitBtn');
@@ -89,8 +185,11 @@ if (savedName) nameEl.value = savedName;
 
 function refreshWhoami(){
   if (myColour) {
+    // the whole page takes the colour the loom handed out
+    document.documentElement.style.setProperty('--c', myColour);
     whoamiSwatch.style.background = myColour;
-    whoamiText.textContent = 'you are ' + (savedNameNow() ? `“${savedNameNow()}” ` : '') + 'in this colour';
+    const n = savedNameNow();
+    whoamiText.textContent = (n ? `“${n}” — ` : '') + 'find this colour on the screen';
     whoamiEl.style.display = 'flex';
   } else {
     whoamiEl.style.display = 'none';
@@ -122,6 +221,15 @@ function fieldErr(el, text){
   el.textContent = text; el.classList.add('show');
 }
 
+/* The phrase lifts away as a bubble — the same shape the projector floats in its queue rail. */
+function launchBubble(text){
+  const b = document.createElement('div');
+  b.className = 'launch';
+  b.textContent = text;
+  document.body.append(b);
+  setTimeout(() => b.remove(), 2400);
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   clearFieldErrs();
@@ -132,13 +240,13 @@ form.addEventListener('submit', async (e) => {
   const name = nameEl.value.trim();
 
   let ok = true;
-  if (!text) { fieldErr(textErrEl, 'say something first.'); ok = false; }
-  else if (text.length > TEXT_MAX) { fieldErr(textErrEl, `too long — ${text.length}/${TEXT_MAX}.`); ok = false; }
-  if (name.length > NAME_MAX) { fieldErr(nameErrEl, `too long — ${name.length}/${NAME_MAX}.`); ok = false; }
+  if (!text) { fieldErr(textErrEl, 'Say something first.'); ok = false; }
+  else if (text.length > TEXT_MAX) { fieldErr(textErrEl, `Too long — ${text.length}/${TEXT_MAX}.`); ok = false; }
+  if (name.length > NAME_MAX) { fieldErr(nameErrEl, `Too long — ${name.length}/${NAME_MAX}.`); ok = false; }
   if (!ok) return;
 
   submitBtn.disabled = true;
-  submitBtn.textContent = 'sending…';
+  submitBtn.textContent = 'Sending…';
 
   const payload = { text, name };
   if (myId) payload.id = myId;   // send back id so the same contributor keeps their colour
@@ -158,9 +266,11 @@ form.addEventListener('submit', async (e) => {
       if (name) localStorage.setItem('loom_name', name);
       refreshWhoami();
 
-      const depthNote = (typeof j.depth === 'number') ? ` — ${j.depth} phrase${j.depth === 1 ? '' : 's'} in the queue.` : '';
-      showMsg('ok', `<span class="swatch" style="background:${c.colour || '#888'}"></span>
-        <span>in the loom now.${depthNote}</span>`);
+      const depthNote = (typeof j.depth === 'number')
+        ? ` — ${j.depth} phrase${j.depth === 1 ? '' : 's'} waiting to be woven.` : '.';
+      showMsg('ok', `<span class="swatch" style="background:${c.colour || '#9fb4d0'}"></span>
+        <span>In the loom now${depthNote}</span>`);
+      launchBubble(text);
 
       // don't lock the form (item 5) — clear the phrase so the box is ready for the next one,
       // but keep the name (name is a device-level setting, not a per-submission field)
@@ -169,22 +279,22 @@ form.addEventListener('submit', async (e) => {
       textEl.focus();
 
     } else if (res.status === 429) {
-      showMsg('err', `hang on — your last ones haven't landed yet.`);
+      showMsg('err', `Hang on — your last ones haven't landed yet.`);
       // deliberately do not clear textEl — let them retry without losing what they typed
     } else if (res.status === 400) {
       let detail = '';
       try { const j = await res.json(); detail = j.message || j.error || ''; } catch {}
-      showMsg('err', detail || 'that phrase was rejected — check it isn\'t empty.');
+      showMsg('err', detail || 'That phrase was rejected — check it isn\'t empty.');
     } else {
       let detail = '';
       try { const j = await res.json(); detail = j.message || j.error || ''; } catch {}
-      showMsg('err', detail || `something went wrong (HTTP ${res.status}). try again.`);
+      showMsg('err', detail || `Something went wrong (HTTP ${res.status}). Try again.`);
     }
   } catch (err) {
-    showMsg('err', `couldn't reach the loom — check you're on the same wifi, then try again.`);
+    showMsg('err', `Couldn't reach the loom — check you're on the same wifi, then try again.`);
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = 'throw it in';
+    submitBtn.textContent = 'Throw it in';
   }
 });
 </script>
