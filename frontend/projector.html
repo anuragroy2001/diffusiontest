@@ -11,6 +11,7 @@
   :root{
     /* cloudy white: pearl over highlight, never flat paper */
     --cloud-0:#fbfcfe; --cloud-1:#f1f4fa; --cloud-2:#e7edf7; --cloud-3:#dae3f0;
+    --thread:#c0233c;
     --mist:#b9c7dc; --ink:#333f52; --ink-2:#6c7c93; --ink-3:#93a2b8;
 
     --story:'Nunito','Segoe UI',system-ui,-apple-system,sans-serif;
@@ -203,6 +204,24 @@
   #queuecount em{font-style:normal;font-size:26px;font-weight:700;color:#5c6b82}
 
   /* ---------- transient notes ---------- */
+  /* ---------- the loom ----------
+     A round in flight is drawn as thread: from each bubble the round took, down into the canvas
+     position where that phrase actually landed. Sits above the story but under the band, so a
+     thread reads as running out from behind its own bubble.
+     pathLength=1 normalises every path to one unit, so a single dash keyframe fits any length. */
+  #threads{position:fixed;inset:0;z-index:4;pointer-events:none;overflow:visible}
+  .thread{fill:none;stroke:var(--thread);stroke-width:1.7;stroke-linecap:round;opacity:.55;
+    stroke-dasharray:1;stroke-dashoffset:0;animation:tie .9s cubic-bezier(.35,0,.15,1)}
+  .shuttle{fill:none;stroke:var(--thread);stroke-width:3.2;stroke-linecap:round;opacity:.95;
+    stroke-dasharray:.05 .95;animation:run 1.7s linear infinite}
+  @keyframes tie{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+  @keyframes run{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+  /* the smallest tail puff becomes the knot the thread is tied off at */
+  .bub-wrap.weaving .bub::after{background:var(--thread);opacity:.9;
+    box-shadow:0 0 10px rgba(192,35,60,.5)}
+  /* the landing site glows while its round is still running */
+  body.weaving .tk.pin{box-shadow:0 0 13px rgba(192,35,60,.16)}
+
   #toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%) translateY(14px);z-index:6;
     font-family:var(--soft);font-weight:600;font-size:15px;color:var(--ink-2);
     background:rgba(255,255,255,.9);padding:12px 24px;border-radius:30px;
@@ -267,6 +286,8 @@
     <div id="queuecount">the room is quiet</div>
   </div>
 </div>
+
+<svg id="threads" aria-hidden="true"><g id="threadG"></g></svg>
 
 <div id="toast"></div>
 
@@ -600,7 +621,10 @@ function renderFrame(tokens){
     if(c.el.className !== cls) c.el.className = cls;
     if(pin && c.el.style.getPropertyValue('--c') !== pin.colour)
       c.el.style.setProperty('--c', pin.colour);
+    if(pin){ if(c.el.dataset.pin !== pin.id) c.el.dataset.pin = pin.id; }
+    else if(c.el.dataset.pin !== undefined) delete c.el.dataset.pin;
   }
+  drawThreads();          // the pins just moved with the text, so re-aim every thread
 }
 
 /* ---------- the queue ---------- */
@@ -616,6 +640,68 @@ const weaving = new Set();                       // bubbles a round has taken, a
 function releaseWeaving(){
   weaving.forEach(w => { w.classList.add('going'); setTimeout(() => w.remove(), 900); });
   weaving.clear();
+  drawThreads();
+}
+
+/* ---------- threads ---------- */
+const threadG = $('#threadG');
+const SVGNS = 'http://www.w3.org/2000/svg';
+const esc = v => (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&');
+
+/* Slack rather than straight, and bowed sideways: a round always takes the phrases at the head of
+   the queue, so every thread would otherwise drop from the same corner in near-parallel lines. The
+   bow throws each one wide on its own side, so they sweep the scene and cross each other. */
+function bowOf(key){
+  let h = 0;
+  for(let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
+  h = Math.abs(h);
+  return (h % 2 ? 1 : -1) * (130 + h % 190);
+}
+
+function threadPath(x1, y1, x2, y2, bow){
+  const k = Math.max(48, Math.abs(y2 - y1) * 0.42);
+  const n = v => v.toFixed(1);
+  return `M${n(x1)},${n(y1)} C${n(x1 + bow)},${n(y1 + k)} ${n(x2 - bow)},${n(y2 - k)} ${n(x2)},${n(y2)}`;
+}
+
+function drawThreads(){
+  document.body.classList.toggle('weaving', weaving.size > 0);
+  const live = new Set();
+  for(const w of weaving){
+    const key = w.dataset.key || '';
+    if(!key || w.classList.contains('going')) continue;
+    const b = w.getBoundingClientRect();
+    if(!b.width) continue;
+    // aim at the phrase's own pinned run; before the first frame lands, at the paragraph itself
+    const pin = document.querySelector(`.tk.pin[data-pin="${esc(key.split('|')[0])}"]`);
+    const host = pin || weavingEl();
+    if(!host) continue;
+    const t = host.getBoundingClientRect();
+    if(!t.width && !t.height) continue;
+    live.add(key);
+    const d = threadPath(b.left + b.width / 2, b.bottom - 6,
+                         t.left + t.width / 2, t.top + t.height / 2, bowOf(key));
+    let g = threadG.querySelector(`g[data-key="${esc(key)}"]`);
+    if(!g){
+      g = document.createElementNS(SVGNS, 'g');
+      g.dataset.key = key;
+      for(const cls of ['thread', 'shuttle']){
+        const path = document.createElementNS(SVGNS, 'path');
+        path.setAttribute('class', cls);
+        path.setAttribute('pathLength', '1');
+        g.append(path);
+      }
+      threadG.append(g);
+    }
+    for(const path of g.children) path.setAttribute('d', d);
+  }
+  for(const g of [...threadG.children]) if(!live.has(g.dataset.key)) g.remove();
+}
+
+let threadTick = 0;
+function queueThreads(){
+  if(threadTick) return;
+  threadTick = requestAnimationFrame(() => { threadTick = 0; drawThreads(); });
 }
 const keyOf = p => p.contributor + '|' + p.at + '|' + p.text;   // `at` alone collides when one
                                                  // person has two phrases stamped the same instant
@@ -749,6 +835,7 @@ function connect(){
           bubbles.delete(w.dataset.key);
           weaving.add(w);
         });
+        drawThreads();
         $('#meta').textContent = d.retro
           ? `round ${d.round} · revising an earlier line`
           : `round ${d.round} · ${d.kind}`;
@@ -815,7 +902,7 @@ function connect(){
         toast('the loom let that one go', 2600);
         // the server puts these phrases back at the head of the queue, so clear the held bubbles
         // outright and let the next `queue` event build them again in their restored places
-        weaving.forEach(w => w.remove()); weaving.clear();
+        weaving.forEach(w => w.remove()); weaving.clear(); drawThreads();
         weavingBlock = null; weavingKind = null; weavingRetro = false;
         resetCanvas();
         renderStory();
@@ -832,13 +919,17 @@ function connect(){
         break;
 
       case 'error':
-        weaving.forEach(w => w.remove()); weaving.clear();
+        weaving.forEach(w => w.remove()); weaving.clear(); drawThreads();
         toast('a thread slipped — the story is unchanged', 4200);
         break;
     }
   };
 }
 connect();
+
+// the band is fixed but the story scrolls under it, so a live thread has to be re-aimed
+$('#story').addEventListener('scroll', queueThreads, {passive:true});
+addEventListener('resize', queueThreads);
 
 /* ---------- the close: scrub the whole weave ---------- */
 let lapse = {on:false, revs:[], i:0, timer:null, paused:false};
