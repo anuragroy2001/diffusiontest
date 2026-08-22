@@ -109,7 +109,7 @@ class Plates:
                 # A safety block or a text-only reply. Retrying rarely helps, so surface it.
                 raise PlateError("no image in response: " + json.dumps(data)[:300])
             except urllib.error.HTTPError as e:
-                last = "HTTP %s %s" % (e.code, e.read()[:200].decode("utf-8", "replace"))
+                last = "HTTP %s: %s" % (e.code, _reason(e.read()))
                 if e.code not in (429, 500, 503) or attempt == self.retries:
                     raise PlateError(last) from None
             except urllib.error.URLError as e:
@@ -118,6 +118,20 @@ class Plates:
                     raise PlateError(last) from None
             time.sleep(1.5 * (attempt + 1))
         raise PlateError(last or "unreachable")
+
+
+def _reason(body: bytes) -> str:
+    """Google's error body is a nested envelope; the useful sentence is one field down.
+
+    Worth unwrapping rather than dumping raw -- a bad or rotated key is the most likely failure in the
+    room, and it should read as one line, not as a wall of JSON."""
+    try:
+        err = json.loads(body).get("error", {})
+        msg = err.get("message") or ""
+        status = err.get("status") or ""
+        return ("%s (%s)" % (msg, status)) if status and msg else (msg or status or "unknown")
+    except Exception:
+        return body[:160].decode("utf-8", "replace")
 
 
 def _first_image(data: dict) -> bytes | None:

@@ -143,6 +143,8 @@ def repl(s: Session) -> None:
                 s.edit(line)
         except PlateError as e:
             print("  ! %s" % e)
+        except KeyboardInterrupt:
+            print("\n  ^C -- plate cancelled, session kept")
 
 
 def serve(directory: Path, port: int) -> str:
@@ -179,8 +181,11 @@ def main() -> None:
                     help="drop the keep-composition clause, to see why it is there")
     ap.add_argument("--no-style-hold", action="store_true",
                     help="stop re-asserting the painted medium on each edit, to watch it drift")
-    ap.add_argument("--serve", nargs="?", const=8090, type=int, default=None, metavar="PORT",
-                    help="serve the viewer on 127.0.0.1:PORT (default 8090) and live-update it")
+    # --serve takes no value: an optional-value flag would swallow the prompt that follows it.
+    ap.add_argument("--serve", action="store_true",
+                    help="serve the viewer on 127.0.0.1 and live-update it as plates land")
+    ap.add_argument("--port", type=int, default=8090, metavar="N",
+                    help="port for --serve (default 8090; scans upward if busy)")
     ap.add_argument("--edit", action="append", default=[],
                     help="run an edit non-interactively; repeatable, then exits")
     args = ap.parse_args()
@@ -198,11 +203,20 @@ def main() -> None:
     viewer.write(s.chain, s.out)           # exists before the first plate, so the page can be opened now
     (s.out / "chain.json").write_text("[]", encoding="utf-8")
     if args.serve:
-        print("view: %s   (live -- new plates appear on their own)" % serve(s.out, args.serve))
-    if args.prompt:
-        s.base(" ".join(args.prompt))
-    for e in args.edit:
-        s.edit(e)
+        print("view: %s   (live -- new plates appear on their own)" % serve(s.out, args.port))
+    try:
+        if args.prompt:
+            s.base(" ".join(args.prompt))
+        for e in args.edit:
+            s.edit(e)
+    except KeyboardInterrupt:
+        print("\n  ^C -- stopped")
+        if s.chain:
+            s.view()
+        return
+    except PlateError as e:
+        print("  ! %s" % e)
+        raise SystemExit(1)
     if args.edit:
         s.view(); return
     repl(s)
