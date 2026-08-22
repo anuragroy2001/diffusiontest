@@ -82,6 +82,24 @@
   /* before the room has thrown in anything, the live paragraph is this line instead of empty prose */
   .para.gathering{text-align:center;font-style:italic;color:var(--ink-2)}
 
+  /* an already-settled paragraph being deliberately revised — a warm ring, deliberately outside the
+     contributor palette so it never reads as attribution */
+  .para.retro{border-radius:28px;padding:.5em .7em;margin:0 auto .85em;
+    animation:revise 2.2s ease-in-out infinite}
+  @keyframes revise{
+    0%,100%{box-shadow:0 0 0 2px color-mix(in srgb,#d8a24a 35%,transparent),
+      0 3px 14px color-mix(in srgb,#d8a24a 10%,transparent)}
+    50%{box-shadow:0 0 0 2.5px color-mix(in srgb,#d8a24a 65%,transparent),
+      0 3px 16px color-mix(in srgb,#d8a24a 22%,transparent)}}
+  /* a downstream paragraph quietly re-absorbing an earlier edit — much quieter than a deliberate one */
+  .para.rippling{animation:flicker 1.8s ease-in-out infinite}
+  @keyframes flicker{0%,100%{opacity:.82}50%{opacity:.58}}
+  /* one-shot flash the instant a deliberate edit lands, so it reads differently from an ordinary commit */
+  .para.landed{animation:land 1.1s ease}
+  @keyframes land{
+    0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,#d8a24a 0%,transparent)}
+    35%{box-shadow:0 0 0 8px color-mix(in srgb,#d8a24a 30%,transparent)}}
+
   /* ---------- condensation ----------
      A position's token is vapour the step it changes and hardens as it holds. Glyphs are drawn
      by text-shadow while vapour: an inline filter fragments across line breaks, and 256 shadowed
@@ -178,6 +196,18 @@
     opacity:0;pointer-events:none;transition:opacity .5s ease,transform .5s ease}
   #toast.on{opacity:1;transform:translateX(-50%)}
 
+  /* ---------- edit-in-place: double-click a line and type straight into it ---------- */
+  .para[contenteditable]{outline:none;cursor:text}
+  .para.editing{background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,255,255,.82));
+    border-radius:28px;padding:.5em .7em;opacity:1;color:var(--ink);caret-color:#d8a24a;
+    box-shadow:0 0 0 2px color-mix(in srgb,#d8a24a 45%,transparent),
+      0 6px 24px rgba(120,142,178,.14)}
+  /* the how-to rides inside the ring but outside the editable text (pseudo-content can't be typed in) */
+  .para.editing::after{content:'type new words into the line · enter weaves them in · esc lets go';
+    display:block;margin-top:.6em;font-family:var(--soft);font-weight:600;font-size:12.5px;
+    letter-spacing:.08em;text-transform:uppercase;
+    color:color-mix(in srgb,#d8a24a 70%,#5a6678)}
+
   /* ---------- time-lapse close ---------- */
   #lapse{position:fixed;inset:0;z-index:8;background:rgba(247,249,253,.93);
     backdrop-filter:blur(9px);display:none;flex-direction:column;padding:5vh 8vw}
@@ -225,6 +255,15 @@
 <div id="float"><div id="bubbles"></div></div>
 
 <div id="toast"></div>
+
+<div id="composer">
+  <div class="ch"><span id="composerLabel">revising a line</span><button type="button" class="close" id="composerClose">&times;</button></div>
+  <div id="composerPara"></div>
+  <div id="composerRow">
+    <textarea id="composerText" maxlength="240" placeholder="a stolen accordion…"></textarea>
+    <button type="button" id="composerSend">throw it in</button>
+  </div>
+</div>
 
 <div id="lapse">
   <div class="lh"><span id="lapseRound">round</span><span id="lapseKind"></span></div>
@@ -288,10 +327,19 @@ function paint(text, into){
 }
 
 /* ---------- the story ---------- */
-let paragraphs = [], liveIdx = 0;
+let paragraphs = [], paragraphIds = [], liveIdx = 0;
 // True from the first `round_start` onward. Before that, paragraph 0 is empty by design (the room
 // writes the opening line too — see loom/server.py) and #story shows an invitation instead of prose.
 let weavingStarted = false;
+
+// `liveIdx` is the persistent growth edge, set only from the server's authoritative state/round_end/
+// split events. `weaving*` is transient — which block a round is *currently* touching, and how — set
+// on round_start and cleared on commit/round_rejected/round_end. They're kept apart because a round
+// can touch a paragraph that isn't live at all: a deliberate edit of an old paragraph, or a passive
+// ripple re-absorbing one. Conflating them under one `.live` treatment would make all three look the
+// same on screen.
+let weavingBlock = null, weavingKind = null, weavingRetro = false;
+const weavingEl = () => $(`.para[data-i="${weavingBlock}"]`);
 
 function renderStory(){
   const host = $('#story');
@@ -307,13 +355,134 @@ function renderStory(){
   }
   paragraphs.forEach((text, i) => {
     const p = document.createElement('p');
-    p.className = 'para ' + (i === liveIdx ? 'live' : 'settled');
+    let cls = 'para';
+    if(i === liveIdx) cls += ' live';
+    else if(i === weavingBlock && weavingKind === 'weave' && weavingRetro) cls += ' retro';
+    else if(i === weavingBlock && weavingKind === 'ripple') cls += ' rippling';
+    else cls += ' settled';
+    if(revising && i !== liveIdx) cls += ' editable';
+    p.className = cls;
     p.dataset.i = i;
+    if(typeof paragraphIds[i] !== 'undefined') p.dataset.id = paragraphIds[i];
     paint(text, p);
     host.append(p);
   });
   scrollToLive();
 }
+
+/* ---------- click-to-edit: revise an already-settled paragraph directly on the story ----------
+   The projector is the shared, one-and-only screen the whole room watches, so an edit made here
+   is a deliberate operator action, not a per-contributor submission -- it gets its own persisted
+   identity (distinct from any phone's), separate from the crowd's live phrases. */
+const reviseToggle = $('#reviseToggle');
+const composerEl = $('#composer'), composerParaEl = $('#composerPara'), composerTextEl = $('#composerText');
+const composerSendEl = $('#composerSend'), composerCloseEl = $('#composerClose');
+
+let revising = false;       // whether settled paragraphs are currently clickable
+let editTargetId = null;    // paragraph id the composer is aimed at
+let editAfter = null;       // sentence index within it, if picked
+let opId = localStorage.getItem('loom_operator_id') || null;
+
+// Mirrors loom/weave.py's split_sentences -- a placement hint for tap targets, not authoritative;
+// the server independently re-derives and bounds-checks `after` against its own split at submit time.
+function splitSentences(text){
+  const out = [];
+  const end = /[.!?]+["”'\)\]]*\s+/g;
+  let start = 0, m;
+  while ((m = end.exec(text))){ out.push(text.slice(start, m.index + m[0].length)); start = end.lastIndex; }
+  if (text.slice(start).trim()) out.push(text.slice(start));
+  return out;
+}
+
+function setRevising(on){
+  revising = on;
+  reviseToggle.classList.toggle('on', on);
+  reviseToggle.textContent = on ? 'tap a line to revise it' : 'revise a line';
+  renderStory();   // reapply .editable to the current paragraphs
+  if(!on) closeComposer();
+}
+reviseToggle.addEventListener('click', () => setRevising(!revising));
+
+function openComposer(id, text){
+  editTargetId = id; editAfter = null;
+  composerParaEl.innerHTML = '';
+  splitSentences(text).forEach((s, i) => {
+    const span = document.createElement('span');
+    span.className = 'sent'; span.textContent = s;
+    span.addEventListener('click', () => {
+      editAfter = (editAfter === i) ? null : i;
+      composerParaEl.querySelectorAll('.sent').forEach(el => el.classList.remove('picked'));
+      if(editAfter === i) span.classList.add('picked');
+    });
+    composerParaEl.append(span);
+  });
+  composerEl.classList.add('on');
+  composerTextEl.value = '';
+  composerTextEl.focus();
+}
+function closeComposer(){
+  composerEl.classList.remove('on');
+  editTargetId = null; editAfter = null;
+}
+composerCloseEl.addEventListener('click', closeComposer);
+
+async function sendEdit(){
+  const text = composerTextEl.value.trim().replace(/\s+/g, ' ');
+  if(!text || editTargetId === null) return;
+  composerSendEl.disabled = true;
+  const payload = { text, target_id: editTargetId };
+  if(editAfter !== null) payload.after = editAfter;
+  if(opId) payload.id = opId;
+  try {
+    const res = await fetch(`${API}/submit`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+    let j = {};
+    try { j = await res.json(); } catch {}
+    if(res.status === 200){
+      if(j.contributor && j.contributor.id){ opId = j.contributor.id; localStorage.setItem('loom_operator_id', opId); }
+      toast(j.target_applied === false
+        ? (j.target_reason || 'that line changed before it landed') + ' — joined the live line instead'
+        : 'pinned into that line', 3000);
+      closeComposer();
+      setRevising(false);
+    } else {
+      toast(j.message || j.error || `couldn't send that (HTTP ${res.status})`, 3400);
+    }
+  } catch {
+    toast('couldn\'t reach the loom', 3000);
+  } finally {
+    composerSendEl.disabled = false;
+  }
+}
+composerSendEl.addEventListener('click', sendEdit);
+composerTextEl.addEventListener('keydown', e => {
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendEdit(); }
+});
+
+// delegated, not bound per-paragraph -- renderStory() rebuilds #story's children on every commit
+$('#story').addEventListener('click', (e) => {
+  if(!revising) return;
+  const p = e.target.closest('.para');
+  if(!p || !p.classList.contains('editable')) return;
+  const i = Number(p.dataset.i);
+  openComposer(paragraphIds[i], paragraphs[i]);
+});
+
+// double-click is always live, toggle or not -- any line opens the composer directly, the live
+// one included: early on the whole story is one live paragraph, and excluding it would leave
+// nothing editable at all
+$('#story').addEventListener('dblclick', (e) => {
+  const p = e.target.closest('.para');
+  if(!p) return;
+  const i = Number(p.dataset.i);
+  if(!weavingStarted) return;
+  if(typeof paragraphIds[i] === 'undefined') return;
+  // a double-click also selects the word under the cursor; drop that so the composer opens clean
+  const sel = window.getSelection();
+  if(sel) sel.removeAllRanges();
+  openComposer(paragraphIds[i], paragraphs[i]);
+});
 
 /* ---------- the illustration ----------
    Only ever holds the latest still per paragraph block, from the server's own `images` map / `image`
@@ -362,7 +531,7 @@ let pinAt = new Map();          // canvas position -> {colour, id}
 function resetCanvas(){ cells = []; pinAt = new Map(); }
 
 function renderFrame(tokens){
-  const host = liveEl();
+  const host = weavingEl();
   if(!host) return;
   if(!cells.length) host.replaceChildren();
 
@@ -468,7 +637,9 @@ function toast(msg, ms = 3600){
 function applyState(s){
   contributors = s.contributors || {};
   paragraphs = s.paragraphs || [];
+  paragraphIds = s.paragraph_ids || [];
   liveIdx = s.live || 0;
+  weavingBlock = null; weavingKind = null; weavingRetro = false;
   images = s.images || {};
   if(typeof s.round === 'number' && s.round > 0) weavingStarted = true;
   for(const p of (s.pending || [])) learn(p.text, p.contributor);
@@ -512,7 +683,7 @@ function connect(){
 
       case 'round_start': {
         weavingStarted = true;
-        liveIdx = d.block;
+        weavingBlock = d.block; weavingKind = d.kind; weavingRetro = !!d.retro;
         for(const s of (d.submissions || [])){
           if(s.colour && s.contributor && !contributors[s.contributor])
             contributors[s.contributor] = {id:s.contributor, name:'', colour:s.colour};
@@ -530,7 +701,9 @@ function connect(){
           // drop it once it has drifted down into the weave, so the rail closes up behind it
           setTimeout(() => w.remove(), 700);
         });
-        $('#meta').textContent = `round ${d.round} · ${d.kind}`;
+        $('#meta').textContent = d.retro
+          ? `round ${d.round} · revising an earlier line`
+          : `round ${d.round} · ${d.kind}`;
         break;
       }
 
@@ -549,13 +722,21 @@ function connect(){
         renderFrame(d.tokens || []);
         break;
 
-      case 'commit':
+      case 'commit': {
         // authoritative — displayed story text never comes from frames
         for(const sp of (d.spans || [])) learn(sp.text, sp.id);
         paragraphs[d.block] = d.text;
+        const flashLanding = !!d.retro;
+        weavingBlock = null; weavingKind = null; weavingRetro = false;
         resetCanvas();
         renderStory();
+        if(flashLanding){
+          // a deliberate edit landing gets a distinct flash from an ordinary live commit
+          const el = $(`.para[data-i="${d.block}"]`);
+          if(el){ el.classList.add('landed'); setTimeout(() => el.classList.remove('landed'), 1200); }
+        }
         break;
+      }
 
       case 'image':
         // a still companion, not video — arrives roughly once per committed round, well after the
@@ -565,9 +746,10 @@ function connect(){
         break;
 
       case 'round_rejected': {
-        const el = liveEl();
+        const el = $(`.para[data-i="${d.block}"]`);
         if(el){ el.classList.add('rejected'); setTimeout(()=>el.classList.remove('rejected'), 1600); }
         toast('the loom let that one go', 2600);
+        weavingBlock = null; weavingKind = null; weavingRetro = false;
         resetCanvas();
         renderStory();
         break;
@@ -628,7 +810,10 @@ function step(){
 }
 addEventListener('keydown', e => {
   if(e.key === 't' || e.key === 'T'){ lapse.on ? closeLapse() : openLapse(); return; }
-  if(!lapse.on) return;
+  if(!lapse.on){
+    if(e.key === 'Escape' && composerEl.classList.contains('on')) closeComposer();
+    return;
+  }
   if(e.key === 'Escape') closeLapse();
   else if(e.key === ' '){ e.preventDefault(); lapse.paused = !lapse.paused; step(); }
   else if(e.key === 'ArrowRight'){ lapse.paused = true; if(lapse.i < lapse.revs.length-1){ lapse.i++; showRev(); } }

@@ -114,10 +114,12 @@ class Pending:
     text: str
     contributor: str
     at: float
-    target: int | None = None     # paragraph index; None means whichever is live when the round runs
+    target_id: int | None = None  # paragraph id; None means whichever is live when the round runs
+    after: int | None = None      # sentence index within that paragraph to insert behind; None spreads
 
     def as_json(self) -> dict:
-        return {"text": self.text, "contributor": self.contributor, "at": self.at, "target": self.target}
+        return {"text": self.text, "contributor": self.contributor, "at": self.at,
+                "target_id": self.target_id, "after": self.after}
 
 
 @dataclass
@@ -130,12 +132,13 @@ class Revision:
     after: str
     seed: int
     kind: str                                 # "weave" | "ripple"
+    retro: bool = False                       # a weave round that edited an already-settled paragraph
     submissions: list[dict] = field(default_factory=list)
     spans: list[dict] = field(default_factory=list)   # where the pins landed, from the backend
 
     def as_json(self) -> dict:
         return {"n": self.n, "at": self.at, "block": self.block, "before": self.before,
-                "after": self.after, "seed": self.seed, "kind": self.kind,
+                "after": self.after, "seed": self.seed, "kind": self.kind, "retro": self.retro,
                 "submissions": self.submissions, "spans": self.spans}
 
 
@@ -191,6 +194,12 @@ class Loom:
         # phrases arrive first into this empty paragraph, exactly the "submissions floating in free
         # space" case plan_weave already supports.
         self.paragraphs: list[str] = [""]
+        # Opaque, permanent identity for each paragraph -- indices shift as the story grows (a split can
+        # insert a new paragraph), but an id, once assigned, is never reassigned or reused. Anything a
+        # client wants to reference later (an edit target) should hold the id, not the index.
+        self.paragraph_ids: list[int] = [0]
+        self._next_pid = 1
+        self._pid_index: dict[int, int] = {0: 0}   # paragraph id -> current index
         self.live = 0
         self.pending: deque[Pending] = deque()
         self.contributors: dict[str, Contributor] = {}
@@ -232,23 +241,43 @@ class Loom:
             self.contributors[c.id] = c
             return c
 
-    def submit(self, text: str, contributor: Contributor, target: int | None = None) -> dict:
+    def submit(self, text: str, contributor: Contributor, target_id: int | None = None,
+               after: int | None = None) -> dict:
         text = re.sub(r"\s+", " ", text).strip()[:MAX_PHRASE]
         if not text:
             raise ValueError("empty phrase")
+        target_applied: bool | None = None
+        target_reason: str | None = None
         with self.lock:
             if len(self.pending) >= MAX_PENDING:
                 raise RuntimeError("the loom is full — try again in a moment")
             mine = sum(1 for p in self.pending if p.contributor == contributor.id)
             if mine >= MAX_PER_PERSON:
                 raise RuntimeError(f"you already have {mine} phrases waiting")
-            if target is not None and not 0 <= target < len(self.paragraphs):
-                target = None
+            if target_id is not None:
+                idx = self._pid_index.get(target_id)
+                if idx is None:
+                    target_applied, target_reason = False, "that paragraph no longer exists"
+                    after = None
+                else:
+                    target_applied = True
+                    if after is not None:
+                        n_sents = len(split_sentences(self.paragraphs[idx]))
+                        if not 0 <= after < n_sents:
+                            after = None   # out of range -- fall back to auto-placement
+            else:
+                after = None   # an anchor is meaningless without knowing whose sentences it counts
             self.pending.append(Pending(text=text, contributor=contributor.id, at=time.time(),
-                                        target=target))
+                                        target_id=target_id if target_applied else None,
+                                        after=after if target_applied else None))
             depth = len(self.pending)
         self.bus.publish({"type": "queue", "depth": depth, "pending": self.pending_json()})
-        return {"queued": True, "depth": depth}
+        out = {"queued": True, "depth": depth}
+        if target_applied is not None:
+            out["target_applied"] = target_applied
+            if target_reason is not None:
+                out["target_reason"] = target_reason
+        return out
 
     def pending_json(self) -> list[dict]:
         with self.lock:
@@ -258,6 +287,7 @@ class Loom:
         with self.lock:
             return {
                 "paragraphs": list(self.paragraphs),
+                "paragraph_ids": list(self.paragraph_ids),
                 "live": self.live,
                 "round": self.round,
                 "busy": self.busy,
@@ -280,13 +310,13 @@ class Loom:
 
     def _worker(self) -> None:
         while not self._stop.is_set():
-            batch = self._take_batch()
+            batch, block = self._take_batch()
             try:
                 if batch:
                     if not self.started:
                         self._bootstrap(batch)
                     else:
-                        self._run_round(batch, kind="weave")
+                        self._run_round(batch, kind="weave", block=block)
                 elif self.ripple:
                     with self.lock:
                         block = self.ripple.popleft()
@@ -301,24 +331,31 @@ class Loom:
                 with self.lock:
                     self.busy = False
 
-    def _take_batch(self) -> list[Pending]:
+    def _take_batch(self) -> tuple[list[Pending], int | None]:
         """Drain up to MAX_PER_ROUND phrases that all want the same paragraph. Mixing targets in one
-        canvas is not possible — a canvas is one paragraph — so the rest keep their place in the queue."""
+        canvas is not possible — a canvas is one paragraph — so the rest keep their place in the queue.
+        Returns the batch alongside the paragraph index it resolved to, so the worker can hand that
+        straight to `_run_round` as `block` instead of it silently defaulting back to live."""
         with self.lock:
             if not self.pending:
-                return []
+                return [], None
+
+            def resolve(p: Pending) -> int:
+                if p.target_id is None:
+                    return self.live
+                return self._pid_index.get(p.target_id, self.live)
+
             head = self.pending[0]
-            want = self.live if head.target is None else head.target
+            want = resolve(head)
             batch, keep = [], deque()
             for p in self.pending:
-                target = self.live if p.target is None else p.target
-                if target == want and len(batch) < MAX_PER_ROUND:
+                if resolve(p) == want and len(batch) < MAX_PER_ROUND:
                     batch.append(p)
                 else:
                     keep.append(p)
             self.pending = keep
             self.busy = True
-            return batch
+            return batch, want
 
     def _requeue(self, batch: list[Pending]) -> None:
         """Return an unconsumed batch to the head of the queue, keeping its original order."""
@@ -418,10 +455,11 @@ class Loom:
             self.round += 1
             n = self.round
             target = self.live if block is None else min(block, len(self.paragraphs) - 1)
+            retro = kind == "weave" and target != self.live
             before = self.paragraphs[target]
             people = {c.id: c for c in self.contributors.values()}
 
-        subs = [Submission(text=p.text, id=p.contributor) for p in batch]
+        subs = [Submission(text=p.text, id=p.contributor, after=p.after) for p in batch]
         protect = tuple(t for t in self.absorbed if t in before)  # nobody's phrase gets deleted
         # A ripple round has nothing new to weave, so it would reproduce the paragraph verbatim -- give
         # it a sentence to rewrite instead. Chosen from the round number rather than at random: the
@@ -435,7 +473,7 @@ class Loom:
         seed = 1000 + n
 
         self.bus.publish({
-            "type": "round_start", "round": n, "kind": kind, "block": target,
+            "type": "round_start", "round": n, "kind": kind, "block": target, "retro": retro,
             "seed": seed, "used": plan.used, "canvas": plan.canvas, "notes": plan.notes,
             "submissions": [{"text": p.text, "contributor": p.contributor,
                              "colour": people[p.contributor].colour if p.contributor in people else None}
@@ -469,7 +507,7 @@ class Loom:
                 if p.text in after:
                     self.absorbed.add(p.text)
             rev = Revision(n=n, at=time.time(), block=target, before=before, after=after, seed=seed,
-                           kind=kind, spans=spans,
+                           kind=kind, retro=retro, spans=spans,
                            submissions=[{"text": p.text, "contributor": p.contributor} for p in batch])
             self.history.append(rev)
             # A change to an earlier paragraph has to propagate: every paragraph after it re-denoises in
@@ -480,7 +518,7 @@ class Loom:
                         self.ripple.append(i)
 
         self.bus.publish({"type": "commit", "round": n, "block": target, "text": after,
-                          "spans": spans, "kind": kind})
+                          "spans": spans, "kind": kind, "retro": retro})
         self._maybe_illustrate(target, n, after)
         self._maybe_split()
         self.last_round = time.time()
@@ -589,10 +627,17 @@ class Loom:
             self.paragraphs[self.live] = tail
             prev = self.live - 1
             if prev >= 0 and self.tok.count(self.paragraphs[prev]) + head_n <= PARA_MAX:
+                # The overflow joins prev's existing identity -- it's the same paragraph, just longer.
                 self.paragraphs[prev] = f"{self.paragraphs[prev].rstrip()} {head}".strip()
             else:
+                # The overflow becomes a new paragraph with a fresh id, inserted just ahead of the live
+                # one -- which keeps its own id at its new, shifted-by-one index: it's still the same
+                # paragraph that was live a moment ago, just shorter.
                 self.paragraphs.insert(self.live, head)
+                self.paragraph_ids.insert(self.live, self._next_pid)
+                self._next_pid += 1
                 self.live += 1
+                self._pid_index = {pid: i for i, pid in enumerate(self.paragraph_ids)}
             live, n = self.live, len(self.paragraphs)
         self.bus.publish({"type": "split", "live": live, "paragraphs": n, "state": self.state()})
 
@@ -708,9 +753,12 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             return self._err(400, "'text' must be a non-empty string")
         who = LOOM.contributor_for(str(req.get("name") or ""), req.get("id"))
-        target = req.get("target")
+        target_id = req.get("target_id")
+        target_id = int(target_id) if isinstance(target_id, (int, float)) else None
+        after = req.get("after")
+        after = int(after) if isinstance(after, (int, float)) else None
         try:
-            out = LOOM.submit(text, who, int(target) if isinstance(target, (int, float)) else None)
+            out = LOOM.submit(text, who, target_id, after)
         except ValueError as e:
             return self._err(400, str(e))
         except RuntimeError as e:
