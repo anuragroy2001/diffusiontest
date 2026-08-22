@@ -4,7 +4,11 @@ One **plate** per story beat. A plate is made by *editing the previous plate*, n
 fresh image, and that single choice is what the whole visual effect rests on.
 
     export GEMINI_API_KEY=...
-    python3 loom/plates/cli.py "A lone knight travels through an ancient forest"
+    python3 loom/plates/cli.py --serve "A lone knight travels through an ancient forest"
+
+`--serve` prints a `http://127.0.0.1:8090` URL and keeps it live: leave the page open and every plate
+you render appears on its own and plays its transition. (Without `--serve` the page still works, but
+`file://` cannot poll the manifest, so you re-run `:view` and reload by hand.)
 
 That renders the opening plate and drops you at a prompt. Every line you type is an edit — `he's
 actually a robot`, `the year is 3000` — which is the same shape a Loom round has. `:view` writes a page

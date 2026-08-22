@@ -61,7 +61,9 @@ class Session:
         path.write_bytes(img)
         self.chain.append({"file": str(path), "prompt": prompt, "secs": secs,
                            "kind": kind, "model": model})
-        (self.out / "chain.json").write_text(json.dumps(self.chain, indent=1), encoding="utf-8")
+        (self.out / "chain.json").write_text(json.dumps(viewer.slim(self.chain), indent=1),
+                                             encoding="utf-8")
+        viewer.write(self.chain, self.out)
         print("  %s  %.1fs  %d KB  [%s]" % (path.name, secs, len(img) // 1024, model))
 
     def base(self, prompt: str, model: str | None = None) -> None:
@@ -81,6 +83,9 @@ class Session:
         if len(self.chain) <= 1:
             print("  nothing to undo"); return
         Path(self.chain.pop()["file"]).unlink(missing_ok=True)
+        (self.out / "chain.json").write_text(json.dumps(viewer.slim(self.chain), indent=1),
+                                             encoding="utf-8")
+        viewer.write(self.chain, self.out)
         print("  back to %s" % Path(self.chain[-1]["file"]).name)
 
     def view(self) -> None:
@@ -140,6 +145,30 @@ def repl(s: Session) -> None:
             print("  ! %s" % e)
 
 
+def serve(directory: Path, port: int) -> str:
+    """Background HTTP server over the plate directory. Localhost only -- nothing here is for the tailnet."""
+    import functools
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    class Quiet(SimpleHTTPRequestHandler):
+        # The page polls twice a second; logging that would bury the prompt you are typing at.
+        def log_message(self, *a, **k):
+            pass
+
+    handler = functools.partial(Quiet, directory=str(directory))
+    for p in range(port, port + 20):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", p), handler)
+            break
+        except OSError:
+            continue
+    else:
+        return "no free port near %d" % port
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return "http://127.0.0.1:%d" % p
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Prompt-driven plate chain for The Loom.")
     ap.add_argument("prompt", nargs="*", help="opening prompt; omit to start empty")
@@ -150,6 +179,8 @@ def main() -> None:
                     help="drop the keep-composition clause, to see why it is there")
     ap.add_argument("--no-style-hold", action="store_true",
                     help="stop re-asserting the painted medium on each edit, to watch it drift")
+    ap.add_argument("--serve", nargs="?", const=8090, type=int, default=None, metavar="PORT",
+                    help="serve the viewer on 127.0.0.1:PORT (default 8090) and live-update it")
     ap.add_argument("--edit", action="append", default=[],
                     help="run an edit non-interactively; repeatable, then exits")
     args = ap.parse_args()
@@ -164,6 +195,10 @@ def main() -> None:
     s = Session(api, out, args.style, "" if args.no_preserve else PRESERVE,
                 "" if args.no_style_hold else STYLE_HOLD)
     print("out: %s\nmodel: %s" % (out, api.model))
+    viewer.write(s.chain, s.out)           # exists before the first plate, so the page can be opened now
+    (s.out / "chain.json").write_text("[]", encoding="utf-8")
+    if args.serve:
+        print("view: %s   (live -- new plates appear on their own)" % serve(s.out, args.serve))
     if args.prompt:
         s.base(" ".join(args.prompt))
     for e in args.edit:
