@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,14 +36,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from illustrate import Illustrator  # noqa: E402
-from weave import ECHO, Policy, Submission, Tokenizer, plan_weave, split_sentences, tidy  # noqa: E402
+from weave import ECHO, META, Policy, Submission, Tokenizer, plan_weave, split_sentences, tidy  # noqa: E402
 
 DG_API   = os.environ.get("DG_API", "http://100.70.13.60:8080")
 PORT     = int(os.environ.get("LOOM_PORT", "8082"))
 
 MAX_PER_ROUND = int(os.environ.get("LOOM_MAX_PER_ROUND", "2"))   # see the module docstring
 MAX_PENDING   = int(os.environ.get("LOOM_MAX_PENDING", "60"))    # queue cap; beyond this /submit is 429
-MAX_PER_PERSON = 3                                               # pending phrases one contributor may hold
+MAX_PER_PERSON = int(os.environ.get("LOOM_MAX_PER_PERSON", "8"))
+                         # pending phrases one contributor may hold. The default is sized for a
+                         # one-phone room: at 3, the fourth phrase of a demo bounced with a 429.
 MAX_PHRASE    = 120                                              # characters
 MAX_EDIT      = 2000     # characters an /edit replacement may hold — a paragraph, not a chapter
 MAX_TRIES     = int(os.environ.get("LOOM_MAX_TRIES", "3"))
@@ -56,6 +58,12 @@ SPLIT_AT      = 185      # tokens the live paragraph is trimmed back to, leaving
                          # settles. A nearly-full canvas rewrites the paragraph instead of extending it.
 PARA_MAX      = 260      # tokens a frozen paragraph may reach before the overflow starts a new one
 ACCEPT_RATIO  = 0.75     # fraction of pinned story spans that must survive for a round to be committed
+RIPPLE_TRIES  = 3        # attempts a seam-smoothing ripple gets before the verbatim text just stands.
+                         # One silent rejection after an operator edit reads as "editing does nothing",
+                         # so a rejected ripple retries on the next round's seed instead of giving up.
+TELEGRAM_WORDS = 4       # a sentence this short is a beat; a RUN of them is the model looping
+TELEGRAM_NEW  = 4        # new beats one round may add before it reads as "He is brave. He is strong."
+TRIGRAM_NEW   = 4        # new repeats of one trigram a round may add before it reads as a chant
 DUP_RUN       = 12       # words: a verbatim run this long shared with another paragraph is plagiarism,
                          # not prose. Given a wide gap and neighbouring text in the prompt, the model
                          # will happily copy a whole passage across instead of writing a new one.
@@ -82,7 +90,41 @@ SYSTEM = "You are a prose continuation engine. Prose only."
 PALETTE = ["#f07178", "#7aa2f7", "#7ec699", "#e0af68", "#c99bf5",
            "#56b6c2", "#ff9e64", "#bb9af7", "#9ece6a", "#f7768e"]
 
-_BOOTSTRAP_BULLET = re.compile(r"^\s*[*\-]\s{2,}.*$", re.M)
+# One space after the bullet, not two: _bootstrap_prose collapses space runs BEFORE this filter
+# runs, so a `\s{2,}` requirement matched almost nothing and outline lines slid through whole.
+_BOOTSTRAP_BULLET = re.compile(r"^\s*[*\-]\s+.*$", re.M)
+
+# The cold open's other failure: the whole completion is thought-channel deliberation ("wants me
+# to continue a story. However, no story has been provided. I need to create a starting point").
+# That vocabulary is unbounded, so no label regex wins -- but opening PROSE never talks about
+# stories, prompts, or what "I should" do, so any hit means the attempt was thought, not story.
+# Rejecting outright is safe: the caller retries on a second seed, and the floor under both
+# failing is an opening of just the bare phrase, which the smoothing ripple then grows.
+_THOUGHT = re.compile(r"(?i)\b(?:story|stories|narrative|prose|prompt|continuation|protagonist"
+                      r"|character|reader|writer|genre|I need|I should|I will|I am|I'll|wants me"
+                      r"|let me|my task)\b")
+
+# "battlefield.The mud" -- a gap the model opened without its leading-space token, fusing two
+# sentences at the seam. Lowercase-then-punctuation on the left so "U.S." stays whole. Applied at
+# commit time, AFTER _accept: pins are laid from the committed story, so repairing the text before
+# the span checks would make a pin from an already-fused paragraph fail its own survival test.
+_FUSED = re.compile(r'([a-z][.!?]["”\']?)(?=[A-Z])')
+
+# Seam damage a weave leaves behind at a gap boundary, in ascending order of shame: sentence
+# punctuation chased by a colon/semicolon ('battlefield.: " mud clung'), a doubled word pair
+# ("like the like the scales"), a tripled word ("a grinding grinding grinding"). All observed
+# in committed output; none is something prose does on purpose.
+_STUTTERS = (re.compile(r'[.!?]["”\']*\s*[:;]'),
+             re.compile(r"\b(\w+\s+\w+)\s+\1\b", re.I),
+             re.compile(r"\b(\w+)\s+\1\s+\1\b", re.I),
+             # a single doubled word ("a heavy bottle bottle wedged") -- 5+ letters, so the
+             # doublings English does on purpose ("had had", "that that", "very very") stay legal
+             re.compile(r"\b(\w{5,})\s+\1\b", re.I))
+
+
+def _respace(text: str) -> str:
+    text = re.sub(r"\s*\n+\s*", " ", text)   # a committed paragraph is one line, always
+    return _FUSED.sub(r"\1 ", text)
 
 
 def _bootstrap_prose(raw: str) -> str:
@@ -99,8 +141,21 @@ def _bootstrap_prose(raw: str) -> str:
     matches = list(_BOOTSTRAP_BULLET.finditer(raw))
     tail = raw[matches[-1].end():] if matches else raw
     tail = tail.replace("*", "").strip()
+    # The model does not always plan in bullets -- observed live: "Topic: A knight with a gun.
+    # Task: Constraint: (no meta-talk...). Setting: ...", inline, which sailed past the bullet
+    # filter, COMMITTED as the opening paragraph, and then poisoned every later round (the pins
+    # feed "Task:" back to the model, tidy() cuts it from the output, the span check rejects --
+    # forever). Planning comes first and prose last in a cold open, so keep only what follows the
+    # LAST meta marker, minus the tail end of the planning sentence it sits in; if nothing but
+    # planning came back, the empty result makes the caller retry on its second seed.
+    marks = list(META.finditer(tail))
+    if marks:
+        tail = tail[marks[-1].end():]
+        first = min((i for i in (tail.find(c) for c in ".!?") if i >= 0), default=-1)
+        tail = tail[first + 1:].strip() if first >= 0 else ""
     end = max((tail.rfind(c) for c in ".!?"), default=-1)
-    return tail[:end + 1].strip() if end >= 0 else ""
+    tail = tail[:end + 1].strip() if end >= 0 else ""
+    return "" if _THOUGHT.search(tail) else tail
 
 
 def _punctuate(phrase: str) -> str:
@@ -242,6 +297,7 @@ class Loom:
         # that paragraph, which dissolves the seam's neighbours so the model blends around the insert
         # instead of rewriting an arbitrary sentence.
         self.smooth: dict[int, int] = {}
+        self.smooth_tries: dict[int, int] = {}   # rejected attempts per smoothing ripple; see RIPPLE_TRIES
         self.busy = False
         # True once the first round has ever committed. Generating into a still-empty canvas (nobody
         # has submitted yet) makes the model write a planning outline instead of prose, so the worker
@@ -319,9 +375,11 @@ class Loom:
         - A pure insertion is treated like a submission that skipped the queue — the inserted run joins
           `absorbed` so every future round pins it, and the paragraph itself is queued for a smoothing
           ripple that re-denoises the sentences around the seam. Inclusion by construction, spectacle
-          afterwards; a rejected smoothing ripple just leaves the verbatim text standing.
-        - A rewrite or deletion stays untouched by the model: the operator wrote exactly what they want
-          the line to say, so only the downstream cascade runs.
+          afterwards; a rejected smoothing ripple retries (RIPPLE_TRIES) before the verbatim text stands.
+        - A rewrite or deletion keeps the operator's words verbatim too (nothing dissolves the seam
+          sentence itself), but the paragraph is still queued for the same smoothing ripple: the
+          sentences AROUND the change re-denoise, so an edit is always answered by visible reweaving.
+          "The loom did nothing" after an edit is the failure the demo cannot afford.
 
         A phrase a rewrite removed stops being re-pinned on its own: protection is presence-filtered
         against the paragraph's current text every round, so no `absorbed` cleanup is needed."""
@@ -358,6 +416,13 @@ class Loom:
             if pure_insert:
                 self._absorb_verbatim(idx, inserted, contributor.id, a)
             else:
+                # A rewrite or deletion: the operator's text is already exactly right, but the loom
+                # still answers with a smoothing ripple around the seam — the same treatment as an
+                # insertion, minus the protection (there may be nothing inserted to protect).
+                self.smooth[idx] = _sentence_at(text, min(a, max(0, len(text) - 1)))
+                self.smooth_tries.pop(idx, None)
+                if idx not in self.ripple:
+                    self.ripple.appendleft(idx)
                 for i in range(idx + 1, len(self.paragraphs)):
                     if i not in self.ripple:
                         self.ripple.append(i)
@@ -378,6 +443,7 @@ class Loom:
         ripple, which is why its seed phrase stayed fused to the continuation."""
         self.absorbed[phrase] = contributor
         self.smooth[idx] = _sentence_at(self.paragraphs[idx], seam_at)
+        self.smooth_tries.pop(idx, None)
         if idx not in self.ripple:
             self.ripple.appendleft(idx)   # blend the seam before the downstream cascade
         for i in range(idx + 1, len(self.paragraphs)):
@@ -388,12 +454,14 @@ class Loom:
         """A phrase that failed MAX_TRIES weave rounds lands verbatim instead — the same inclusion-by-
         construction _bootstrap uses, because with one phone in the room every phrase is precious and
         'the loom quietly gave up' is the one outcome the contributor cannot see. Spliced in after its
-        anchor sentence (or at the end without one), protected, and queued for a smoothing ripple."""
+        anchor sentence (or mid-paragraph without one — appending at the end read as a bolted-on
+        fragment, and left the phrase facing the open tail where the model loops instead of prose
+        on both sides to blend into), protected, and queued for a smoothing ripple."""
         with self.lock:
             idx = self._pid_index.get(p.target_id, self.live) if p.target_id is not None else self.live
             before = self.paragraphs[idx]
             sents = split_sentences(before)
-            at = len(sents) - 1 if p.after is None else max(-1, min(p.after, len(sents) - 1))
+            at = max(0, len(sents) // 2 - 1) if p.after is None else max(-1, min(p.after, len(sents) - 1))
             head = "".join(sents[:at + 1]).rstrip()
             tail = "".join(sents[at + 1:]).lstrip()
             text = " ".join(part for part in (head, _punctuate(p.text), tail) if part)
@@ -539,6 +607,16 @@ class Loom:
         # continuation: "a knight enters the battlefield Sir Alistair stepped into the churn".
         seed_text = " ".join(_punctuate(p.text) for p in batch)
         seed = 1000 + n
+        # Announced BEFORE the generation, not after: the cold open is the longest round of the whole
+        # story (~20-40s), and it is the very first thing the room watches. Announcing it up front is
+        # what lets the projector hold the bubble lit and draw its thread while the loom works --
+        # published after, the round existed on screen for one frame and the threads never appeared.
+        self.bus.publish({"type": "round_start", "round": n, "kind": "bootstrap", "block": 0,
+                          "seed": seed, "submissions": [
+                              {"text": p.text, "contributor": p.contributor,
+                               "colour": self.contributors[p.contributor].colour
+                                         if p.contributor in self.contributors else None}
+                              for p in batch]})
         continuation = ""
         # One retry on a different seed: ~20% of opens come back with no sentence-ending punctuation
         # at all (the model spends its budget in the thought channel and gets cut off mid-clause), and
@@ -554,8 +632,12 @@ class Loom:
             if continuation:
                 sents = split_sentences(continuation)
                 continuation = "".join(sents[:BOOTSTRAP_SENTENCES]).strip()
+                # The kept prose can begin mid-thought ("Knight with a gun. rain slicked the
+                # cobblestones") when the cut fell inside the model's deliberation. It follows a
+                # punctuated seed sentence, so it always opens a new one.
+                continuation = continuation[:1].upper() + continuation[1:]
                 break
-        after = f"{seed_text} {continuation}".strip() if continuation else seed_text
+        after = _respace(f"{seed_text} {continuation}".strip() if continuation else seed_text)
 
         if not after.strip():
             self._requeue(batch)
@@ -565,12 +647,6 @@ class Loom:
             return
 
         spans = [{"text": p.text, "id": p.contributor} for p in batch if p.text in after]
-        self.bus.publish({"type": "round_start", "round": n, "kind": "bootstrap", "block": 0,
-                          "seed": seed, "submissions": [
-                              {"text": p.text, "contributor": p.contributor,
-                               "colour": self.contributors[p.contributor].colour
-                                         if p.contributor in self.contributors else None}
-                              for p in batch]})
 
         with self.lock:
             self.paragraphs[0] = after
@@ -610,6 +686,7 @@ class Loom:
         # itself. The round-number fallback covers a seam with no usable neighbours, and is
         # deterministic because the revision log has to replay exactly for the time-lapse at the end.
         dissolve: tuple[int, ...] = ()
+        hint: int | None = None
         if not subs:
             n_sents = len(split_sentences(before))
             with self.lock:
@@ -647,6 +724,19 @@ class Loom:
             for p in batch:
                 p.tries += 1
             self._requeue([p for p in batch if p.tries < MAX_TRIES])
+            # A smoothing ripple exists because an operator or contributor just watched their words
+            # land and is waiting for the loom to answer. One silent rejection reads as "editing does
+            # nothing", so the seam goes back on the queue for another try on a fresh seed.
+            if kind == "ripple" and hint is not None:
+                with self.lock:
+                    tries = self.smooth_tries.get(target, 0) + 1
+                    if tries < RIPPLE_TRIES:
+                        self.smooth_tries[target] = tries
+                        self.smooth.setdefault(target, hint)
+                        if target not in self.ripple:
+                            self.ripple.appendleft(target)
+                    else:
+                        self.smooth_tries.pop(target, None)
             self.bus.publish({"type": "round_rejected", "round": n, "block": target, "reason": reason})
             for p in batch:
                 if p.tries >= MAX_TRIES:
@@ -661,7 +751,9 @@ class Loom:
                 edited_under_us = True
             else:
                 edited_under_us = False
+                after = _respace(after)
                 self.paragraphs[target] = after
+                self.smooth_tries.pop(target, None)
                 self.started = True
                 for p in batch:
                     if p.text in after:
@@ -721,9 +813,41 @@ class Loom:
             # tidy() scrubs these; this is the backstop for any path that skirts it, because an
             # echo that commits gets pinned as story on every round after.
             return "the prompt echoed into the story"
+        if len(META.findall(text)) > len(META.findall(before)):
+            # Same backstop for meta-talk ("Task:", "Setting:") -- committed once, it gets pinned
+            # into every later canvas and tidy()'s cut then fails those rounds' span checks forever.
+            # Measured against `before` so a paragraph already carrying it can still be rewoven out.
+            return "meta-talk crept into the story"
         run = self._copied_run(text, target, before)
         if run:
             return f"copied a passage: {run[:60]!r}"
+        loop = self._degenerate(text, before)
+        if loop:
+            return f"the model looped: {loop}"
+        return None
+
+    @staticmethod
+    def _degenerate(text: str, before: str) -> str | None:
+        """Repetition-loop damage THIS round added. The model's other failure mode besides copying:
+        a chant of near-identical clauses ("He is brave. He is strong. He is a hero.") that
+        _copied_run cannot see because no single 12-word run ever repeats verbatim. One committed
+        chant poisons the paragraph -- every later round pins it as story and extends it in kind --
+        so it must be rejected at the gate. Measured against `before` for the same reason
+        _copied_run is: a chant that once slipped through must not freeze the paragraph forever."""
+        def trigrams(s: str) -> Counter:
+            w = s.lower().split()
+            return Counter(" ".join(w[i:i + 3]) for i in range(len(w) - 2))
+        now, was = trigrams(text), trigrams(before)
+        worst = max(now, key=lambda r: now[r] - was.get(r, 0), default=None)
+        if worst is not None and now[worst] - was.get(worst, 0) >= TRIGRAM_NEW:
+            return f"chanted {worst!r}"
+        def beats(s: str) -> int:
+            return sum(1 for x in split_sentences(s) if len(x.split()) <= TELEGRAM_WORDS)
+        if beats(text) - beats(before) >= TELEGRAM_NEW:
+            return "a run of telegram sentences"
+        for rx in _STUTTERS:
+            if len(rx.findall(text)) > len(rx.findall(before)):
+                return "a stutter at a seam"
         return None
 
     def _copied_run(self, text: str, target: int, before: str) -> str | None:
@@ -894,14 +1018,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         sys.stderr.write("[loom] %s - %s\n" % (self.address_string(), fmt % a))
 
+    def handle(self):
+        # Phones sleeping, pages reloading, and short-timeout fetches all reset kept-alive
+        # connections constantly; socketserver prints a 15-line traceback for each one, which
+        # buries the log lines that matter mid-demo. A vanished client is routine, not an error.
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _json(self, code: int, obj) -> None:
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up mid-response — likely a short-timeout fetch losing patience with
+            # /state, which carries megabytes of illustration plates. Their loss, not an error:
+            # /stream already treats a vanished client this way, and a stack trace per disconnect
+            # would bury the log lines that matter during the demo.
+            self.close_connection = True
 
     def _err(self, code: int, msg: str) -> None:
         self._json(code, {"error": msg})

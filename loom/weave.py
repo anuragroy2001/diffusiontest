@@ -88,8 +88,10 @@ class Tokenizer:
 # The two failure modes a woven canvas still shows occasionally: the model spends leftover positions on
 # a planning outline, or on commentary about the prompt. seamtest.py scores against these; the server
 # trims at them, because either one on a projector is worse than a slightly shorter paragraph.
-OUTLINE = re.compile(r"^\s*[*\-]\s{2,}|\*\s+\*", re.M)
-META = re.compile(r"the user|Constraint:|Self-Correction|the prompt|\bWait\b|didn't (?:actually )?provide")
+OUTLINE = re.compile(r"^\s*[*\-]\s+|\*\s+\*", re.M)   # one space counts: "* Task:" committed once
+META = re.compile(r"the user|Constraint:|Self-Correction|the prompt|\bWait\b|didn't (?:actually )?provide"
+                  r"|\bTask:|\bContext:|\bGoal:|\bTopic:|\bSetting:|\bTone:|\bGenre:"
+                  r"|prompt snippet|based on the provided|\bprovided prompt\b")
 CHANNEL = re.compile(r"<\|channel>(?:thought)?\s*|<channel\|>")
 # The loom's own words to the model, echoed back into the canvas. These end in sentence punctuation,
 # so every "keep whole sentences" trim waves them through -- they have to be removed by name, and

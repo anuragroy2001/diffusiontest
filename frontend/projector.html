@@ -407,7 +407,12 @@ function renderStory(){
     p.className = cls;
     p.dataset.i = i;
     if(typeof paragraphIds[i] !== 'undefined') p.dataset.id = paragraphIds[i];
-    paint(text, p);
+    if(i === weavingBlock && weavingKind === 'bootstrap' && !text.trim()){
+      // the cold open runs ~30s with no frames to draw; an empty bubble under the threads reads
+      // as broken, so the paragraph says what the loom is doing until the commit fills it in
+      p.classList.add('gathering');
+      p.textContent = 'the loom is weaving the opening line…';
+    } else paint(text, p);
     host.append(p);
   });
   scrollToLive();
@@ -962,6 +967,11 @@ function connect(){
 
       case 'error':
         weaving.forEach(w => w.remove()); weaving.clear(); drawThreads();
+        // the round died mid-flight — clear its transient state or the bootstrap placeholder /
+        // retro ring lingers until the next round happens to reset it
+        weavingBlock = null; weavingKind = null; weavingRetro = false; weavingHadSubs = false;
+        resetCanvas();
+        renderStory();
         toast('a thread slipped — the story is unchanged', 4200);
         break;
     }
