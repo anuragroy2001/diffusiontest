@@ -67,6 +67,22 @@ SYSTEM = "You are a prose continuation engine. Prose only."
 PALETTE = ["#f07178", "#7aa2f7", "#7ec699", "#e0af68", "#c99bf5",
            "#56b6c2", "#ff9e64", "#bb9af7", "#9ece6a", "#f7768e"]
 
+_BOOTSTRAP_BULLET = re.compile(r"^\s*[*\-]\s{2,}.*$", re.M)
+
+
+def _bootstrap_prose(raw: str) -> str:
+    """Extract the story from a cold-open completion. Given only a short phrase to continue from (no
+    established narrative), the model reliably plans in a bulleted outline before it writes real prose
+    -- the opposite order of a normal round, so unlike `tidy()` this keeps the text AFTER the last
+    bulleted line, not before it. Confirmed live: with room to finish (max_tokens=512), good prose
+    consistently follows the outline. Markdown emphasis asterisks around that prose are stripped, and
+    the result is trimmed to the last complete sentence so a token-limit cutoff mid-clause doesn't ship."""
+    matches = list(_BOOTSTRAP_BULLET.finditer(raw))
+    tail = raw[matches[-1].end():] if matches else raw
+    tail = tail.replace("*", "").strip()
+    end = max((tail.rfind(c) for c in ".!?"), default=-1)
+    return tail[:end + 1].strip() if end >= 0 else ""
+
 
 # --------------------------------------------------------------------------------------------------
 # state
@@ -258,7 +274,10 @@ class Loom:
             batch = self._take_batch()
             try:
                 if batch:
-                    self._run_round(batch, kind="weave")
+                    if not self.started:
+                        self._bootstrap(batch)
+                    else:
+                        self._run_round(batch, kind="weave")
                 elif self.ripple:
                     with self.lock:
                         block = self.ripple.popleft()
@@ -313,6 +332,71 @@ class Loom:
         with self.lock:
             prior = self.paragraphs[max(0, block - budget):block]
         return "\n\n".join(p.strip() for p in prior if p.strip())
+
+    def _bootstrap(self, batch: list[Pending]) -> None:
+        """The very first round. `plan_weave` genuinely supports an empty paragraph (it's just
+        submissions floating in free space), but in practice that free space IS almost the entire
+        256-position canvas -- there's no pinned prose yet to deny the model room to plan in, which is
+        exactly the failure weave.py's docstring warns about: DiffusionGemma writes a planning outline
+        instead of story, tidy() strips it, and the round rejects as an empty canvas. Every retry hits
+        the same wall (confirmed: 34 straight rejections in testing).
+
+        A plain chat completion doesn't dodge the planning -- tested live, the model still opens with a
+        bulleted outline even here, given only a short phrase and no established narrative to continue.
+        But the order is the mirror image of a normal round: the outline comes FIRST and clean prose
+        comes LAST once the model talks itself into a scene, so `tidy()` (built to cut at the first bad
+        line and keep the prefix) is exactly backwards for this -- `_bootstrap_prose` keeps the suffix
+        instead. And rather than hope the model repeats a submission verbatim inside that prose (tested:
+        it paraphrases), the phrase is seeded into the paragraph directly, so inclusion is guaranteed by
+        construction, not by the model's cooperation."""
+        with self.lock:
+            self.busy = True
+            self.round += 1
+            n = self.round
+
+        phrases = [p.text for p in batch]
+        seed_text = " ".join(phrases)
+        seed = 1000 + n
+        try:
+            raw = self._chat(f"{seed_text}\n\nContinue the story.", seed, max_tokens=512)
+        except Exception:
+            self._requeue(batch)
+            raise
+        continuation = _bootstrap_prose(raw)
+        after = f"{seed_text} {continuation}".strip() if continuation else seed_text
+
+        if not after.strip():
+            self._requeue(batch)
+            self.bus.publish({"type": "round_rejected", "round": n, "block": 0,
+                              "reason": "the opening didn't land"})
+            self.last_round = time.time()
+            return
+
+        spans = [{"text": p.text, "id": p.contributor} for p in batch if p.text in after]
+        self.bus.publish({"type": "round_start", "round": n, "kind": "bootstrap", "block": 0,
+                          "seed": seed, "submissions": [
+                              {"text": p.text, "contributor": p.contributor,
+                               "colour": self.contributors[p.contributor].colour
+                                         if p.contributor in self.contributors else None}
+                              for p in batch]})
+
+        with self.lock:
+            self.paragraphs[0] = after
+            self.started = True
+            for p in batch:
+                if p.text in after:
+                    self.absorbed.add(p.text)
+            self.history.append(Revision(n=n, at=time.time(), block=0, before="", after=after,
+                                         seed=seed, kind="bootstrap", spans=spans,
+                                         submissions=[{"text": p.text, "contributor": p.contributor}
+                                                      for p in batch]))
+
+        self.bus.publish({"type": "commit", "round": n, "block": 0, "text": after,
+                          "spans": spans, "kind": "bootstrap"})
+        self._maybe_illustrate(0, n, after)
+        self._maybe_split()
+        self.last_round = time.time()
+        self.bus.publish({"type": "round_end", "round": n, "state": self.state()})
 
     def _run_round(self, batch: list[Pending], kind: str, block: int | None = None) -> None:
         with self.lock:
@@ -500,6 +584,17 @@ class Loom:
 
     # ---- the model ----
 
+    def _chat(self, prompt: str, seed: int, max_tokens: int = 256) -> str:
+        """A plain, non-diffusion-canvas completion -- used only by `_bootstrap`."""
+        body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+                "max_tokens": max_tokens, "seed": seed}
+        req = urllib.request.Request(f"{self.api}/v1/chat/completions",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            resp = json.load(r)
+        return resp["choices"][0]["message"]["content"]
+
     def _generate(self, pins: list[dict], seed: int, context: str) -> tuple[list[dict], str]:
         user = (f"{context}\n\nContinue the story." if context else "Continue the story.")
         body = {
@@ -653,7 +748,8 @@ def main() -> None:
 
     LOOM = Loom()
     if not LOOM.illustrator.enabled:
-        print("[loom] GEMINI_API_KEY not set — running text-only, no illustrations (see loom/illustrate.py)")
+        print("[loom] no Gemini keys found (loom/.env: GEMINI_KEY_1/GEMINI_KEY_2) — "
+              "running text-only, no illustrations")
     try:
         with urllib.request.urlopen(f"{LOOM.api}/health", timeout=5) as r:
             json.load(r)
