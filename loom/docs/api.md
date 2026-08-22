@@ -55,6 +55,34 @@ Rate limiting is per contributor id, which is client-supplied — it stops enthu
 There is no profanity filter; the pitch invites the room to be weird, so moderation is a human with the
 projector remote.
 
+## `POST /edit`
+
+The projector's edit-in-place endpoint. `/submit` can only insert a phrase; a deletion or rewrite of
+existing words arrives here as the paragraph's full replacement text, which lands **verbatim** — no
+model round — and then ripples downstream like any other change to an earlier paragraph. A phrase the
+rewrite removed simply stops being re-pinned: span protection is presence-filtered against the current
+text every round.
+
+```jsonc
+// request
+{ "text": "the whole paragraph, as it should now read",   // required; collapsed, capped at 2000 chars
+  "target_id": 2,                                          // required: paragraph id from /state
+  "id": "8f2c...", "name": "..." }                         // optional, same contributor contract as /submit
+
+// 200
+{ "edited": true, "block": 1,       // edited: false when the text was identical to what's there
+  "contributor": { ... } }
+```
+
+| status | when |
+|---|---|
+| `400` | `text` missing/empty, or `target_id` missing |
+| `409` | the paragraph no longer exists, or nothing has been woven yet |
+
+If a weave round is streaming for the same paragraph when the edit lands, the round is rejected at
+commit time ("the paragraph was rewritten mid-round") and its phrases are requeued — the operator's
+text always wins over ~6s-old model prose.
+
 ## `GET /state`
 
 ```jsonc
@@ -76,7 +104,7 @@ projector remote.
 in full, plus `seed`, so any round can be replayed exactly.
 
 ```jsonc
-{ "n": 4, "at": 1.7e9, "block": 1, "kind": "weave", "retro": false,   // kind: weave | ripple
+{ "n": 4, "at": 1.7e9, "block": 1, "kind": "weave", "retro": false,   // kind: weave | ripple | bootstrap | edit
   "before": "...", "after": "...", "seed": 1004,
   "submissions": [ {"text": "a stolen accordion", "contributor": "8f2c..."} ],
   "spans":       [ {"pos": 86, "len": 3, "text": " a stolen accordion", "id": "8f2c..."} ] }
@@ -98,6 +126,7 @@ immediately instead of waiting for the next commit. A `: keepalive` comment goes
 | `pins` | `block`, `spans[]` | **relayed from the model** — where each span landed once tokenized. Arrives before the first frame, so spans can be coloured from step 0 |
 | `frame` | `block`, `step`, `total`, `tokens[]` | **relayed from the model.** One string per canvas position, ~18 per round. Non-monotonic: colour by *change*, not by mask→token |
 | `commit` | `round`, `block`, `text`, `spans`, `kind`, `retro` | the paragraph changed |
+| `edit` | `round`, `block`, `text` | an operator rewrite (`POST /edit`) landed verbatim. Deliberately not a `commit`: it can arrive while a round is streaming a *different* block, and must not read as that round ending |
 | `round_rejected` | `round`, `block`, `reason` | the weave was thrown away; the story is unchanged |
 | `split` | `live`, `paragraphs`, `state` | the live paragraph was trimmed back and the overflow settled |
 | `round_end` | `round`, `state` | |

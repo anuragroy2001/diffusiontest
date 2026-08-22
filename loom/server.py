@@ -45,6 +45,7 @@ MAX_PER_ROUND = int(os.environ.get("LOOM_MAX_PER_ROUND", "2"))   # see the modul
 MAX_PENDING   = int(os.environ.get("LOOM_MAX_PENDING", "60"))    # queue cap; beyond this /submit is 429
 MAX_PER_PERSON = 3                                               # pending phrases one contributor may hold
 MAX_PHRASE    = 120                                              # characters
+MAX_EDIT      = 2000     # characters an /edit replacement may hold — a paragraph, not a chapter
 SPLIT_AT      = 185      # tokens the live paragraph is trimmed back to, leaving ~70 canvas positions of
                          # gap. Keeping it NEAR the canvas size is what stops the story running away:
                          # a small live paragraph means enormous gaps, and the model fills enormous gaps
@@ -279,6 +280,45 @@ class Loom:
                 out["target_reason"] = target_reason
         return out
 
+    def edit(self, target_id: int, text: str, contributor: Contributor) -> dict:
+        """A wholesale rewrite of one paragraph, from the projector's edit-in-place. `/submit` can only
+        insert (the model weaves a phrase around protected text), so deletions and rewrites arrive here
+        instead: the operator's text becomes the paragraph verbatim — no model round, nothing to mangle
+        the words they deliberately typed — and the ripple cascade re-absorbs the change downstream.
+
+        A phrase the rewrite removed stops being re-pinned on its own: protection is presence-filtered
+        against the paragraph's current text every round, so no `absorbed` bookkeeping is needed. The
+        edited paragraph itself is deliberately NOT rippled — the operator just wrote exactly what they
+        want it to say."""
+        text = re.sub(r"\s+", " ", text).strip()[:MAX_EDIT]
+        if not text:
+            raise ValueError("an empty paragraph would tear the story — the whole line must remain")
+        with self.lock:
+            if not self.started:
+                raise LookupError("nothing has been woven yet")
+            idx = self._pid_index.get(target_id)
+            if idx is None:
+                raise LookupError("that paragraph no longer exists")
+            before = self.paragraphs[idx]
+            if text == before:
+                return {"edited": False, "block": idx}
+            self.round += 1
+            n = self.round
+            self.paragraphs[idx] = text
+            self.history.append(Revision(n=n, at=time.time(), block=idx, before=before, after=text,
+                                         seed=0, kind="edit", retro=idx != self.live,
+                                         submissions=[{"text": text, "contributor": contributor.id}]))
+            for i in range(idx + 1, len(self.paragraphs)):
+                if i not in self.ripple:
+                    self.ripple.append(i)
+            block = idx
+        # A dedicated event, not a `commit`: the projector treats `commit` as the end of a round and
+        # clears its weaving state, but an edit can land while a round is streaming a different block.
+        self.bus.publish({"type": "edit", "round": n, "block": block, "text": text})
+        self._maybe_illustrate(block, n, text)
+        self.last_round = time.time()
+        return {"edited": True, "block": block}
+
     def pending_json(self) -> list[dict]:
         with self.lock:
             return [p.as_json() for p in self.pending]
@@ -501,21 +541,33 @@ class Loom:
             return
 
         with self.lock:
-            self.paragraphs[target] = after
-            self.started = True
-            for p in batch:
-                if p.text in after:
-                    self.absorbed.add(p.text)
-            rev = Revision(n=n, at=time.time(), block=target, before=before, after=after, seed=seed,
-                           kind=kind, retro=retro, spans=spans,
-                           submissions=[{"text": p.text, "contributor": p.contributor} for p in batch])
-            self.history.append(rev)
-            # A change to an earlier paragraph has to propagate: every paragraph after it re-denoises in
-            # turn, which is the cascade the audience sees travel down the screen.
-            if kind == "weave" and target < len(self.paragraphs) - 1:
-                for i in range(target + 1, len(self.paragraphs)):
-                    if i not in self.ripple:
-                        self.ripple.append(i)
+            # An /edit may have rewritten this paragraph while the round was streaming. The operator's
+            # text wins — committing over it would silently undo a deliberate rewrite with ~6s-old prose.
+            if self.paragraphs[target] != before:
+                edited_under_us = True
+            else:
+                edited_under_us = False
+                self.paragraphs[target] = after
+                self.started = True
+                for p in batch:
+                    if p.text in after:
+                        self.absorbed.add(p.text)
+                rev = Revision(n=n, at=time.time(), block=target, before=before, after=after, seed=seed,
+                               kind=kind, retro=retro, spans=spans,
+                               submissions=[{"text": p.text, "contributor": p.contributor} for p in batch])
+                self.history.append(rev)
+                # A change to an earlier paragraph has to propagate: every paragraph after it re-denoises
+                # in turn, which is the cascade the audience sees travel down the screen.
+                if kind == "weave" and target < len(self.paragraphs) - 1:
+                    for i in range(target + 1, len(self.paragraphs)):
+                        if i not in self.ripple:
+                            self.ripple.append(i)
+        if edited_under_us:
+            self._requeue(batch)
+            self.bus.publish({"type": "round_rejected", "round": n, "block": target,
+                              "reason": "the paragraph was rewritten mid-round"})
+            self.last_round = time.time()
+            return
 
         self.bus.publish({"type": "commit", "round": n, "block": target, "text": after,
                           "spans": spans, "kind": kind, "retro": retro})
@@ -742,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
-        if path != "/submit":
+        if path not in ("/submit", "/edit"):
             return self._err(404, f"unknown path {self.path}")
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -755,6 +807,16 @@ class Handler(BaseHTTPRequestHandler):
         who = LOOM.contributor_for(str(req.get("name") or ""), req.get("id"))
         target_id = req.get("target_id")
         target_id = int(target_id) if isinstance(target_id, (int, float)) else None
+        if path == "/edit":
+            if target_id is None:
+                return self._err(400, "'target_id' is required")
+            try:
+                out = LOOM.edit(target_id, text, who)
+            except ValueError as e:
+                return self._err(400, str(e))
+            except LookupError as e:
+                return self._err(409, str(e))
+            return self._json(200, {**out, "contributor": who.as_json()})
         after = req.get("after")
         after = int(after) if isinstance(after, (int, float)) else None
         try:

@@ -205,7 +205,7 @@
     box-shadow:0 0 0 2px color-mix(in srgb,#d8a24a 45%,transparent),
       0 6px 24px rgba(120,142,178,.14)}
   /* the how-to rides inside the ring but outside the editable text (pseudo-content can't be typed in) */
-  .para.editing::after{content:'type new words into the line · enter weaves them in · esc lets go';
+  .para.editing::after{content:'edit the line freely · enter commits it · esc lets go';
     display:block;margin-top:.6em;font-family:var(--soft);font-weight:600;font-size:12.5px;
     letter-spacing:.08em;text-transform:uppercase;
     color:color-mix(in srgb,#d8a24a 70%,#5a6678)}
@@ -368,10 +368,10 @@ function renderStory(){
    The projector is the shared, one-and-only screen the whole room watches, so an edit made here
    is a deliberate operator action, not a per-contributor submission -- it gets its own persisted
    identity (distinct from any phone's), separate from the crowd's live phrases.
-   The server only accepts insertions (a phrase for /submit to weave in), never a rewrite, so on
-   enter the line is diffed against its committed text: the one contiguous run of new words becomes
-   the phrase, where it was typed becomes the `after` placement hint, and a deletion means the
-   whole edit is put back with an explanation rather than half-honoured. */
+   On enter the line is diffed against its committed text and routed by what the edit actually is:
+   a pure insertion becomes a phrase for /submit, so the loom visibly weaves it in with placement
+   taken from where it was typed; anything that removed or reworded existing words goes to /edit
+   wholesale, landing verbatim with the ripple cascade re-absorbing it downstream. */
 let editEl = null, editOrig = '', editTargetId = null;
 let opId = localStorage.getItem('loom_operator_id') || null;
 
@@ -416,42 +416,64 @@ function editKeys(e){
   else if(e.key === 'Escape'){ e.preventDefault(); cancelEdit(); }
 }
 
+async function sendLoom(path, payload){
+  if(opId) payload.id = opId;
+  try {
+    const res = await fetch(`${API}${path}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+    let j = {};
+    try { j = await res.json(); } catch {}
+    if(res.status === 200 && j.contributor && j.contributor.id){
+      opId = j.contributor.id; localStorage.setItem('loom_operator_id', opId);
+    }
+    return {ok: res.status === 200, status: res.status, j};
+  } catch {
+    return {ok: false, status: 0, j: {}};
+  }
+}
+const sendFail = r => r.j.message || r.j.error
+  || (r.status ? `couldn't send that (HTTP ${r.status})` : 'couldn\'t reach the loom');
+
 async function commitEdit(){
   if(!editEl) return;
-  const edited = editEl.textContent, orig = editOrig, targetId = editTargetId;
-  cancelEdit();   // the screen goes back to the committed text; the weave brings the change
-  // longest common prefix/suffix -> the one contiguous run that was typed in
+  // contenteditable swaps some spaces for nbsp; normalise before diffing or a pure insertion can
+  // read as a rewrite of the space next to it
+  const edited = editEl.textContent.replace(/\s+/g, ' ').trim();
+  const orig = editOrig, targetId = editTargetId;
+  cancelEdit();   // the screen goes back to the committed text; the loom brings the change
+  if(!edited){ toast('an empty line would tear the story — esc lets go instead', 3400); return; }
+  if(edited === orig) return;
+  // longest common prefix/suffix -> the one contiguous run that changed
   let a = 0;
   const lim = Math.min(orig.length, edited.length);
   while(a < lim && orig[a] === edited[a]) a++;
   let b = 0;
   while(b < lim - a && orig[orig.length - 1 - b] === edited[edited.length - 1 - b]) b++;
-  const inserted = edited.slice(a, edited.length - b).replace(/\s+/g, ' ').trim();
+  const inserted = edited.slice(a, edited.length - b).trim();
   const removed = orig.slice(a, orig.length - b).trim();
-  if(removed){ toast('the loom only weaves new words in — deleted ones were put back', 3600); return; }
+
+  if(removed){
+    // a rewrite or deletion: the typed words become the paragraph verbatim via /edit, and the
+    // ripple cascade re-absorbs the change downstream -- no model round to mangle them
+    const r = await sendLoom('/edit', {text: edited, target_id: targetId});
+    toast(r.ok ? 'rewrote the line — the story is re-absorbing it' : sendFail(r), 3400);
+    return;
+  }
+
   if(!inserted) return;
-  // which sentence the phrase was typed behind, as the placement hint
+  // a pure insertion still goes through /submit, so the loom visibly weaves it in
   let after = null, at = 0;
   splitSentences(orig).forEach((s, i) => { at += s.length; if(at <= a) after = i; });
   const payload = { text: inserted, target_id: targetId };
   if(after !== null) payload.after = after;
-  if(opId) payload.id = opId;
-  try {
-    const res = await fetch(`${API}/submit`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
-    });
-    let j = {};
-    try { j = await res.json(); } catch {}
-    if(res.status === 200){
-      if(j.contributor && j.contributor.id){ opId = j.contributor.id; localStorage.setItem('loom_operator_id', opId); }
-      toast(j.target_applied === false
-        ? (j.target_reason || 'that line changed before it landed') + ' — joined the live line instead'
-        : 'weaving it into that line', 3000);
-    } else {
-      toast(j.message || j.error || `couldn't send that (HTTP ${res.status})`, 3400);
-    }
-  } catch {
-    toast('couldn\'t reach the loom', 3000);
+  const r = await sendLoom('/submit', payload);
+  if(r.ok){
+    toast(r.j.target_applied === false
+      ? (r.j.target_reason || 'that line changed before it landed') + ' — joined the live line instead'
+      : 'weaving it into that line', 3000);
+  } else {
+    toast(sendFail(r), 3400);
   }
 }
 
@@ -715,6 +737,17 @@ function connect(){
           const el = $(`.para[data-i="${d.block}"]`);
           if(el){ el.classList.add('landed'); setTimeout(() => el.classList.remove('landed'), 1200); }
         }
+        break;
+      }
+
+      case 'edit': {
+        // an operator rewrite landing verbatim -- distinct from `commit`, because it can arrive
+        // while a round is still streaming a different block, and must not clear that round's state
+        paragraphs[d.block] = d.text;
+        resetCanvas();   // frame cells point at DOM renderStory is about to rebuild
+        renderStory();
+        const el = $(`.para[data-i="${d.block}"]`);
+        if(el){ el.classList.add('landed'); setTimeout(() => el.classList.remove('landed'), 1200); }
         break;
       }
 
