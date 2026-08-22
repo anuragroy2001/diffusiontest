@@ -60,7 +60,23 @@ Only `lite` keeps up with the round loop. `pro` is for the final plate, when not
 Note that **`gemini-3.7-flash` cannot generate images** — it is on the key and it is a text model. The
 image models are the Nano Banana family above.
 
-## The two defaults that were measured
+## Everything is an oil painting
+
+`STYLE` establishes the medium on the opening plate — oil on canvas, visible brushstrokes and impasto,
+canvas weave showing through, painterly edges. Every later plate is an edit of that one, so if the first
+plate is not convincingly a painting, nothing downstream will be either.
+
+`STYLE_HOLD` re-asserts it on **every edit**, and that is not redundant. An edit instruction describes
+*content* ("he is a robot"), and the model will render new content in its own default idiom — chrome,
+neon and water pull especially hard toward photorealism. State the medium once at the start and the
+chain drifts out of paint within a few beats; state it every time and it holds. Verified on the worst
+case: polished chrome, bright neon signage and a full underwater scene, and the final plate still had
+brushstroke texture in the roots, painterly bloom on the neon, and a painted signature in the corner.
+
+`--no-style-hold` drops the reassertion so you can watch the drift happen.
+
+
+## The three defaults that were measured
 
 - **Re-encode the reference as JPEG** (`as_reference`). Sending the ~900 KB PNG back as the edit
   reference cost 8.7–12.7 s per edit; the same picture as JPEG at 1024px lands at 5.5–5.8 s. Resolution
@@ -68,6 +84,8 @@ image models are the Nano Banana family above.
   about the encoder, not the pixel count. Downscale for bandwidth, not for speed.
 - **The preservation clause** (`PRESERVE` in `cli.py`), appended to every edit. It is what holds camera,
   pose and layout still between plates. Run with `--no-preserve` to watch the chain fall apart.
+- **The style hold** (`STYLE_HOLD`), above. Kept short so it does not compete with the instruction
+  itself for attention.
 
 ## Wiring it to the round loop (not built yet)
 

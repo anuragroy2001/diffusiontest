@@ -28,15 +28,27 @@ from plates.gemini import MODELS, PlateError, Plates          # noqa: E402
 PRESERVE = (" Keep the same character, pose, camera angle, composition and lighting. "
             "Change only what this instruction asks for.")
 
-# Appended to the opening prompt only. A consistent look makes every later edit cheaper to keep on model.
-STYLE = "Cinematic painterly digital art, muted cold palette, dramatic rim light, 16:9."
+# The opening plate establishes the medium. Everything downstream is an edit of this, so if the first
+# plate is not convincingly a painting, nothing later will be either.
+STYLE = ("Traditional oil painting on canvas. Visible brushstrokes and impasto ridges catching the "
+         "light, the woven texture of the canvas showing through thin passages, soft painterly edges, "
+         "layered glazes, muted cold palette, dramatic rim light. This is a painting, not a photograph "
+         "and not a 3D render. 16:9.")
+
+# Re-asserted on every edit, and this is not redundant. An edit instruction describes *content* ("he is
+# a robot"), and the model will happily render new content in its own default idiom -- metal and water
+# in particular pull hard toward photorealism. State the medium once at the start and the chain drifts
+# out of paint within a few beats; state it every time and it holds. Kept short so it does not compete
+# with the instruction itself for attention.
+STYLE_HOLD = (" Keep it a traditional oil painting on canvas: visible brushstrokes, impasto texture, "
+              "canvas weave, painterly edges. Never photorealistic.")
 
 OUT = Path(__file__).resolve().parent / "out"
 
 
 class Session:
-    def __init__(self, api: Plates, out: Path, style: str, preserve: str) -> None:
-        self.api, self.out, self.style, self.preserve = api, out, style, preserve
+    def __init__(self, api: Plates, out: Path, style: str, preserve: str, hold: str) -> None:
+        self.api, self.out, self.style, self.preserve, self.hold = api, out, style, preserve, hold
         self.chain: list[dict] = []
         self.out.mkdir(parents=True, exist_ok=True)
 
@@ -62,7 +74,7 @@ class Session:
         cur = self.current
         if cur is None:
             raise PlateError("no plate yet -- give an opening prompt or use :new")
-        img, secs = self.api.edit(cur, instruction.rstrip() + self.preserve, model)
+        img, secs = self.api.edit(cur, instruction.rstrip() + self.preserve + self.hold, model)
         self._record(img, instruction, secs, "edit", MODELS.get(model or "", model or self.api.model))
 
     def undo(self) -> None:
@@ -136,6 +148,8 @@ def main() -> None:
     ap.add_argument("--style", default=STYLE, help="suffix on the opening prompt")
     ap.add_argument("--no-preserve", action="store_true",
                     help="drop the keep-composition clause, to see why it is there")
+    ap.add_argument("--no-style-hold", action="store_true",
+                    help="stop re-asserting the painted medium on each edit, to watch it drift")
     ap.add_argument("--edit", action="append", default=[],
                     help="run an edit non-interactively; repeatable, then exits")
     args = ap.parse_args()
@@ -147,7 +161,8 @@ def main() -> None:
         print("! %s\n  export GEMINI_API_KEY=... first" % e, file=sys.stderr)
         raise SystemExit(2)
 
-    s = Session(api, out, args.style, "" if args.no_preserve else PRESERVE)
+    s = Session(api, out, args.style, "" if args.no_preserve else PRESERVE,
+                "" if args.no_style_hold else STYLE_HOLD)
     print("out: %s\nmodel: %s" % (out, api.model))
     if args.prompt:
         s.base(" ".join(args.prompt))
