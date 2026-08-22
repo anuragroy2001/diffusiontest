@@ -45,7 +45,6 @@ MAX_PER_ROUND = int(os.environ.get("LOOM_MAX_PER_ROUND", "2"))   # see the modul
 MAX_PENDING   = int(os.environ.get("LOOM_MAX_PENDING", "60"))    # queue cap; beyond this /submit is 429
 MAX_PER_PERSON = 3                                               # pending phrases one contributor may hold
 MAX_PHRASE    = 120                                              # characters
-IDLE_ROUND_S  = float(os.environ.get("LOOM_IDLE_ROUND_S", "25")) # keep the story moving between judges
 SPLIT_AT      = 185      # tokens the live paragraph is trimmed back to, leaving ~70 canvas positions of
                          # gap. Keeping it NEAR the canvas size is what stops the story running away:
                          # a small live paragraph means enormous gaps, and the model fills enormous gaps
@@ -59,6 +58,18 @@ DUP_RUN       = 12       # words: a verbatim run this long shared with another p
 CONTEXT_PARAS = 1        # prior paragraphs given as prompt. More continuity, but also more to copy.
 
 EB = {"eb_max_steps": 24, "eb_t_max": 0.6, "eb_t_min": 0.3}      # settled in loom/seamtest.py
+
+# The cold open runs once per story, not once per round, so it can afford to spend more than a live
+# weave round would: more steps and a lower temperature measurably cut the repetition-loop artifacts
+# ("let let ... hours hours") that EB's live-round settings still let through on a bare autoregressive
+# completion. Measured live: at 512 tokens ~40% of opens came back with no usable continuation at all --
+# the model burns most of the budget in its thought channel and gets cut off before a sentence-ending
+# punctuation mark, so _bootstrap_prose has nothing to keep. 768 tokens (3 canvas blocks) cut that to
+# ~20%; BOOTSTRAP_SENTENCES then caps the survivors to an opener instead of a full purple-prose
+# paragraph.
+BOOTSTRAP_EB = {"eb_max_steps": 32, "eb_t_max": 0.5, "eb_t_min": 0.25}
+BOOTSTRAP_MAX_TOKENS = 768
+BOOTSTRAP_SENTENCES = 3
 
 # Minimal prompt, deliberately. Telling the model to preserve the existing text made it treat the pinned
 # spans as quoted material and wrap them in brackets; the pins already guarantee preservation.
@@ -118,7 +129,7 @@ class Revision:
     before: str
     after: str
     seed: int
-    kind: str                                 # "weave" | "ripple" | "idle"
+    kind: str                                 # "weave" | "ripple"
     submissions: list[dict] = field(default_factory=list)
     spans: list[dict] = field(default_factory=list)   # where the pins landed, from the backend
 
@@ -190,12 +201,10 @@ class Loom:
         self.round = 0
         self.ripple: deque[int] = deque()        # paragraphs waiting to absorb a change made before them
         self.busy = False
-        # True once the first round has ever committed. Gates the idle heartbeat below: generating into
-        # a still-empty canvas (nobody has submitted yet) makes the model write a planning outline
-        # instead of prose, and there is no pinned story text to stop it, unlike every later idle round.
+        # True once the first round has ever committed. Generating into a still-empty canvas (nobody
+        # has submitted yet) makes the model write a planning outline instead of prose, so the worker
+        # loop waits for a real submission before running the first round.
         self.started = False
-        # Start the idle clock now rather than at zero, so the loom sits quiet until someone submits or
-        # IDLE_ROUND_S passes -- otherwise the model is mid-round when the first phrase arrives.
         self.last_round = time.time()
         self._stop = threading.Event()
 
@@ -282,11 +291,6 @@ class Loom:
                     with self.lock:
                         block = self.ripple.popleft()
                     self._run_round([], kind="ripple", block=block)
-                elif self.started and time.time() - self.last_round > IDLE_ROUND_S:
-                    # An untouched story on a projector is a dead exhibit. Keep it breathing -- but
-                    # only once the room has actually started one; before that there is no pinned
-                    # story text to hold the model to prose, so an idle round would just outline.
-                    self._run_round([], kind="idle")
                 else:
                     time.sleep(0.25)
             except Exception as e:                     # a bad round must never kill the loom
@@ -357,12 +361,22 @@ class Loom:
         phrases = [p.text for p in batch]
         seed_text = " ".join(phrases)
         seed = 1000 + n
-        try:
-            raw = self._chat(f"{seed_text}\n\nContinue the story.", seed, max_tokens=512)
-        except Exception:
-            self._requeue(batch)
-            raise
-        continuation = _bootstrap_prose(raw)
+        continuation = ""
+        # One retry on a different seed: ~20% of opens come back with no sentence-ending punctuation
+        # at all (the model spends its budget in the thought channel and gets cut off mid-clause), and
+        # this round only runs once per story -- worth the extra ~20s to not open on the bare phrase.
+        for attempt_seed in (seed, seed + 10_000):
+            try:
+                raw = self._chat(f"{seed_text}\n\nContinue the story.", attempt_seed,
+                                 max_tokens=BOOTSTRAP_MAX_TOKENS, eb=BOOTSTRAP_EB)
+            except Exception:
+                self._requeue(batch)
+                raise
+            continuation = _bootstrap_prose(raw)
+            if continuation:
+                sents = split_sentences(continuation)
+                continuation = "".join(sents[:BOOTSTRAP_SENTENCES]).strip()
+                break
         after = f"{seed_text} {continuation}".strip() if continuation else seed_text
 
         if not after.strip():
@@ -409,9 +423,9 @@ class Loom:
 
         subs = [Submission(text=p.text, id=p.contributor) for p in batch]
         protect = tuple(t for t in self.absorbed if t in before)  # nobody's phrase gets deleted
-        # A round with nothing new to weave would reproduce the paragraph verbatim, so give an idle one a
-        # sentence to rewrite. Chosen from the round number rather than at random: the revision log has
-        # to replay exactly for the time-lapse at the end.
+        # A ripple round has nothing new to weave, so it would reproduce the paragraph verbatim -- give
+        # it a sentence to rewrite instead. Chosen from the round number rather than at random: the
+        # revision log has to replay exactly for the time-lapse at the end.
         dissolve: tuple[int, ...] = ()
         if not subs:
             n_sents = len(split_sentences(before))
@@ -584,10 +598,12 @@ class Loom:
 
     # ---- the model ----
 
-    def _chat(self, prompt: str, seed: int, max_tokens: int = 256) -> str:
-        """A plain, non-diffusion-canvas completion -- used only by `_bootstrap`."""
+    def _chat(self, prompt: str, seed: int, max_tokens: int = 256, eb: dict = EB) -> str:
+        """A plain, non-diffusion-canvas completion -- used only by `_bootstrap`. Needs `EB` tuning same
+        as `_generate` -- without it this call runs at the backend's hotter defaults, and it's the one
+        round with no pinned prose and no gap cap to keep it from rambling or looping."""
         body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-                "max_tokens": max_tokens, "seed": seed}
+                "max_tokens": max_tokens, "seed": seed, **eb}
         req = urllib.request.Request(f"{self.api}/v1/chat/completions",
                                      data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})

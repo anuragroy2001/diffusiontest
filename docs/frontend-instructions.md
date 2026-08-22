@@ -144,9 +144,8 @@ if you want one; not required.
   in the `split` payload) rather than caching indices.
 - **`frame` is lossy by design** — never derive story text from it, only from `commit`.
 - **One model, one lock, globally.** Every submission funnels through the same single-threaded reweave.
-  Rounds are capped at ~2 submissions each (`max_per_round`) and run every ~25s even when idle
-  (`LOOM_IDLE_ROUND_S`) so the story keeps breathing. The rest of the queue waits its turn — again, put
-  that queue depth on screen, it's part of the show.
+  Rounds are capped at ~2 submissions each (`max_per_round`). The rest of the queue waits its turn —
+  again, put that queue depth on screen, it's part of the show.
 - **Nothing is persisted.** If the Loom server restarts, the story and revision log are gone. Don't build
   against an assumption of durability across restarts.
 - Contributor colour is assigned once server-side and is stable as long as you keep sending the same

@@ -13,7 +13,7 @@ to the projector.
 | bind | Tailscale IP, resolved at launch (`LOOM_HOST` to override; `0.0.0.0` is refused) |
 | CORS | open on every response; `OPTIONS` returns 204 |
 
-Other env: `LOOM_MAX_PER_ROUND` (2), `LOOM_MAX_PENDING` (60), `LOOM_IDLE_ROUND_S` (25).
+Other env: `LOOM_MAX_PER_ROUND` (2), `LOOM_MAX_PENDING` (60).
 
 ---
 
@@ -64,7 +64,7 @@ projector remote.
 in full, plus `seed`, so any round can be replayed exactly.
 
 ```jsonc
-{ "n": 4, "at": 1.7e9, "block": 1, "kind": "weave",   // weave | ripple | idle
+{ "n": 4, "at": 1.7e9, "block": 1, "kind": "weave",   // weave | ripple
   "before": "...", "after": "...", "seed": 1004,
   "submissions": [ {"text": "a stolen accordion", "contributor": "8f2c..."} ],
   "spans":       [ {"pos": 86, "len": 3, "text": " a stolen accordion", "id": "8f2c..."} ] }
@@ -108,10 +108,6 @@ to make room, so no client ever misses a commit.
 4. `tidy()` the result, then accept or reject it (below).
 5. Commit, log the revision, and queue a ripple for every paragraph after this one.
 6. Trim the live paragraph back if it has outgrown the canvas.
-
-With no phrases waiting, a round still runs every `IDLE_ROUND_S` so an untouched story keeps breathing.
-An idle round is given one sentence to rewrite, chosen from the round number rather than at random —
-the revision log has to replay exactly.
 
 ## When a round is thrown away
 
