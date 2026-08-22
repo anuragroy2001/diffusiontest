@@ -16,6 +16,7 @@ Run:  python3 loom/server.py
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -28,11 +29,13 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from illustrate import Illustrator  # noqa: E402
 from weave import Policy, Submission, Tokenizer, plan_weave, split_sentences, tidy  # noqa: E402
 
 DG_API   = os.environ.get("DG_API", "http://100.70.13.60:8080")
@@ -63,12 +66,6 @@ SYSTEM = "You are a prose continuation engine. Prose only."
 
 PALETTE = ["#f07178", "#7aa2f7", "#7ec699", "#e0af68", "#c99bf5",
            "#56b6c2", "#ff9e64", "#bb9af7", "#9ece6a", "#f7768e"]
-
-OPENING = (
-    "The lighthouse keeper had not spoken to another human being in four hundred days, and had begun to "
-    "suspect the sea of listening. On the four hundred and first morning a suitcase washed up on the "
-    "shingle. It was dry."
-)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -163,7 +160,10 @@ class Loom:
         self.bus = Bus()
         self.lock = threading.RLock()
 
-        self.paragraphs: list[str] = [OPENING]
+        # The room writes the opening line too -- no fixed premise. The first weave round pins whatever
+        # phrases arrive first into this empty paragraph, exactly the "submissions floating in free
+        # space" case plan_weave already supports.
+        self.paragraphs: list[str] = [""]
         self.live = 0
         self.pending: deque[Pending] = deque()
         self.contributors: dict[str, Contributor] = {}
@@ -174,10 +174,21 @@ class Loom:
         self.round = 0
         self.ripple: deque[int] = deque()        # paragraphs waiting to absorb a change made before them
         self.busy = False
+        # True once the first round has ever committed. Gates the idle heartbeat below: generating into
+        # a still-empty canvas (nobody has submitted yet) makes the model write a planning outline
+        # instead of prose, and there is no pinned story text to stop it, unlike every later idle round.
+        self.started = False
         # Start the idle clock now rather than at zero, so the loom sits quiet until someone submits or
         # IDLE_ROUND_S passes -- otherwise the model is mid-round when the first phrase arrives.
         self.last_round = time.time()
         self._stop = threading.Event()
+
+        # Companion illustrations -- a best-effort side channel, never the round loop's critical path.
+        self.illustrator = Illustrator()
+        self.images: dict[int, dict] = {}          # block -> {"round": n, "data": data-uri}, client-facing
+        self._image_bytes: dict[int, bytes] = {}    # block -> raw bytes, fed back for i2i continuity; never sent
+        self._image_busy: set[int] = set()          # blocks with a call currently in flight
+        self._image_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="loom-image")
 
     # ---- public API used by the HTTP handler ----
 
@@ -228,6 +239,7 @@ class Loom:
                 "pending": [p.as_json() for p in self.pending],
                 "contributors": {k: v.as_json() for k, v in self.contributors.items()},
                 "max_per_round": MAX_PER_ROUND,
+                "images": dict(self.images),
             }
 
     # ---- the round loop ----
@@ -239,6 +251,7 @@ class Loom:
 
     def stop(self) -> None:
         self._stop.set()
+        self._image_pool.shutdown(wait=False)
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -250,8 +263,10 @@ class Loom:
                     with self.lock:
                         block = self.ripple.popleft()
                     self._run_round([], kind="ripple", block=block)
-                elif time.time() - self.last_round > IDLE_ROUND_S:
-                    # An untouched story on a projector is a dead exhibit. Keep it breathing.
+                elif self.started and time.time() - self.last_round > IDLE_ROUND_S:
+                    # An untouched story on a projector is a dead exhibit. Keep it breathing -- but
+                    # only once the room has actually started one; before that there is no pinned
+                    # story text to hold the model to prose, so an idle round would just outline.
                     self._run_round([], kind="idle")
                 else:
                     time.sleep(0.25)
@@ -351,6 +366,7 @@ class Loom:
 
         with self.lock:
             self.paragraphs[target] = after
+            self.started = True
             for p in batch:
                 if p.text in after:
                     self.absorbed.add(p.text)
@@ -367,6 +383,7 @@ class Loom:
 
         self.bus.publish({"type": "commit", "round": n, "block": target, "text": after,
                           "spans": spans, "kind": kind})
+        self._maybe_illustrate(target, n, after)
         self._maybe_split()
         self.last_round = time.time()
         self.bus.publish({"type": "round_end", "round": n, "state": self.state()})
@@ -407,6 +424,40 @@ class Loom:
             if run not in before and any(run in o for o in others):
                 return run                                        # newly lifted from a neighbour
         return None
+
+    def _maybe_illustrate(self, block: int, round_n: int, text: str) -> None:
+        """Fire a background illustration call for this round's committed text. Skipped, not queued, if
+        a call for this block is already in flight -- that call's result is about to be superseded by
+        this round's text anyway, so queuing another request would just spend a second API call on stale
+        text."""
+        if not self.illustrator.enabled:
+            return
+        with self.lock:
+            if block in self._image_busy:
+                return
+            self._image_busy.add(block)
+        self._image_pool.submit(self._illustrate_worker, block, round_n, text)
+
+    def _illustrate_worker(self, block: int, round_n: int, text: str) -> None:
+        try:
+            with self.lock:
+                previous = self._image_bytes.get(block)
+            result = self.illustrator.illustrate(text, previous)
+            if result is None:
+                return
+            img_bytes, mime = result
+            data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
+            with self.lock:
+                # a newer round may have already landed an image for this block while we were waiting on
+                # the network -- drop this one rather than overwrite something fresher with something stale.
+                if self.images.get(block, {}).get("round", -1) >= round_n:
+                    return
+                self._image_bytes[block] = img_bytes
+                self.images[block] = {"round": round_n, "data": data_uri}
+            self.bus.publish({"type": "image", "round": round_n, "block": block, "data": data_uri})
+        finally:
+            with self.lock:
+                self._image_busy.discard(block)
 
     def _maybe_split(self) -> None:
         """Trim the live paragraph back to what the canvas can weave, and settle the overflow behind it.
@@ -601,6 +652,8 @@ def main() -> None:
         sys.exit("ERROR: refusing to bind 0.0.0.0 — set LOOM_HOST to a specific address")
 
     LOOM = Loom()
+    if not LOOM.illustrator.enabled:
+        print("[loom] GEMINI_API_KEY not set — running text-only, no illustrations (see loom/illustrate.py)")
     try:
         with urllib.request.urlopen(f"{LOOM.api}/health", timeout=5) as r:
             json.load(r)
