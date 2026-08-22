@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Loom — projector</title>
+<style>
+  :root{
+    --bg:#0b0d11; --panel:#13161c; --panel2:#191d25; --line:#262c37;
+    --fg:#e8ebf1; --dim:#8b93a1; --accent:#7aa2f7;
+    --hot:#ff7043; --frozen:#6f7686; --ok:#7ec699; --bad:#f07178;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    display:flex;flex-direction:column;overflow:hidden}
+
+  header{flex:none;display:flex;align-items:center;gap:14px;padding:10px 20px;
+    border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.02em}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
+  .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+  #queue{margin-left:auto;font:12px var(--mono);color:var(--dim);
+    background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:5px 12px}
+  #roundBadge{font:12px var(--mono);color:var(--dim)}
+
+  #story{flex:1;overflow-y:auto;padding:28px 8vw 80px;display:flex;flex-direction:column;gap:26px}
+  .para{display:flex;gap:20px;align-items:flex-start;border-radius:10px;padding:14px 16px;
+    border:1px solid transparent}
+  .para.live{background:var(--panel);border-color:var(--accent)}
+  .text{flex:1;min-width:0;font-size:19px;line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere}
+  .para.live .text{font-family:var(--mono);font-size:16px}
+
+  .illus{position:relative;width:150px;height:150px;flex:none;border-radius:8px;overflow:hidden;
+    background:var(--panel2);border:1px solid var(--line)}
+  .illus img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+    opacity:0;transition:opacity .4s ease}
+
+  .tk{border-radius:2px;transition:color .15s ease}
+  .tk.hot{color:var(--hot)}
+  .tk.frozen{color:var(--fg)}
+  .pin{font-weight:600}
+
+  #nowWeaving{flex:none;font:12px var(--mono);color:var(--dim);padding:2px 20px 10px;min-height:14px}
+  #nowWeaving .dot2{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
+
+  #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 16px;
+    font-size:13px;color:var(--dim);opacity:0;transition:opacity .3s ease, transform .3s ease;
+    pointer-events:none;max-width:70vw;text-align:center}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast.reject{color:var(--bad)}
+
+  #timelapse{position:fixed;inset:0;background:rgba(6,7,10,.94);display:none;
+    flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px;z-index:50}
+  #timelapse.show{display:flex}
+  .tl-label{font:12px var(--mono);color:var(--dim);letter-spacing:.05em;text-transform:uppercase}
+  .tl-body{max-width:900px;font-size:26px;line-height:1.5;text-align:center;white-space:pre-wrap}
+  .tl-hint{font:11px var(--mono);color:var(--dim);position:absolute;bottom:20px}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>The Loom</h1>
+  <span id="roundBadge"></span>
+  <span id="queue">— phrases waiting to be woven</span>
+</header>
+
+<div id="nowWeaving"></div>
+<div id="story"></div>
+
+<div id="toast"></div>
+
+<div id="timelapse">
+  <div class="tl-label" id="tlLabel">—</div>
+  <div class="tl-body" id="tlBody">—</div>
+  <div class="tl-hint">Esc to close</div>
+</div>
+
+<script>
+// Backend base URL. Per frontend-spec.md this LAN/Tailscale IP can change on server restart —
+// the server prints the new one on startup. Edit this one constant if it does.
+const API = "http://192.168.100.69:8082";
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ---------------- client-side state (all of it is reset on reconnect, per item 12) ---------------- */
+let state = null;              // last full snapshot: {paragraphs, live, round, busy, pending, contributors, max_per_round, images}
+let liveIndex = -1;            // which paragraph index is currently being rewoven
+let queueDepth = 0;
+
+const contributorColours = {}; // id -> colour, only ever grown from server data (never invented client-side)
+const blockSpansCache = {};    // block -> spans[] from the most recent `commit` for that block (for settled colouring)
+const pinsByBlock = {};        // block -> spans[] from the most recent `pins` event (pre-frame colouring)
+const frameTokens = {};        // block -> last frame's tokens[] (to diff the next frame against)
+const frameAge = {};           // block -> per-position "steps unchanged" counter
+const lastShownRound = {};     // block -> round number of the image currently displayed (to drop stale `image` events)
+const activeLayer = {};        // block -> 'A' | 'B', which <img> layer is currently the visible one
+
+const FROZEN_AFTER = 2; // token unchanged this many consecutive frames -> render as settled, not churning
+
+/* ---------------- span-based colouring ----------------
+   Spans everywhere in this API share the same shape: {pos, len, text, id} — character offsets into
+   a text string, id is a contributor id. We resolve id -> colour via contributorColours, which is
+   built only from `contributors` (in `state`) and whatever colour accompanies submissions/spans on
+   other events — never generated client-side. */
+function renderTextWithSpans(text, spans, colours){
+  text = text || '';
+  if(!spans || !spans.length) return esc(text);
+  const sorted = spans.slice().sort((a,b)=>a.pos-b.pos);
+  let html = '', cursor = 0;
+  for(const sp of sorted){
+    const start = Math.max(sp.pos, cursor), end = Math.min(sp.pos + sp.len, text.length);
+    if(end <= start) continue;
+    if(start > cursor) html += esc(text.slice(cursor, start));
+    const colour = colours[sp.id];
+    const seg = esc(text.slice(start, end));
+    html += colour ? `<span class="pin" style="color:${colour}">${seg}</span>` : seg;
+    cursor = end;
+  }
+  if(cursor < text.length) html += esc(text.slice(cursor));
+  return html;
+}
+
+function paragraphHTML(i){
+  const text = (state && state.paragraphs && state.paragraphs[i]) || '';
+  return renderTextWithSpans(text, blockSpansCache[i], contributorColours);
+}
+
+// live-canvas rendering: token-by-token, churn vs frozen, with pin colours overlaid by character offset
+function tokensHTML(block){
+  const tokens = frameTokens[block] || [];
+  const ages = frameAge[block] || [];
+  const spans = pinsByBlock[block];
+  let offset = 0, html = '';
+  for(let i=0;i<tokens.length;i++){
+    const tok = tokens[i] ?? '';
+    const start = offset, end = offset + tok.length;
+    offset = end;
+    let colour = null;
+    if(spans){
+      for(const sp of spans){
+        if(start < sp.pos + sp.len && end > sp.pos){ colour = contributorColours[sp.id]; break; }
+      }
+    }
+    const frozen = (ages[i] || 0) >= FROZEN_AFTER;
+    const cls = 'tk ' + (frozen ? 'frozen' : 'hot');
+    const style = colour ? ` style="color:${colour}"` : '';
+    html += `<span class="${cls}"${style}>${esc(tok)}</span>`;
+  }
+  return html;
+}
+
+function mergeContributors(contributors){
+  if(!contributors) return;
+  for(const id in contributors){
+    const c = contributors[id];
+    if(c && c.colour) contributorColours[id] = c.colour;
+  }
+}
+function mergeSubmissionColours(subs){
+  if(!Array.isArray(subs)) return;
+  for(const s of subs){
+    const id = s.id || s.contributor;
+    const colour = s.colour;
+    if(id && colour) contributorColours[id] = colour;
+  }
+}
+
+/* ---------------- images (item 10) ---------------- */
+function setImageInstant(block, src){
+  const a = document.getElementById('imgA-'+block), b = document.getElementById('imgB-'+block);
+  if(!a || !b) return;
+  a.style.transition = 'none'; b.style.transition = 'none';
+  a.src = src; a.style.opacity = 1;
+  b.removeAttribute('src'); b.style.opacity = 0;
+  activeLayer[block] = 'A';
+  requestAnimationFrame(()=>{ a.style.transition = ''; b.style.transition = ''; });
+}
+function crossfadeImage(block, src){
+  const a = document.getElementById('imgA-'+block), b = document.getElementById('imgB-'+block);
+  if(!a || !b) return;
+  const activeIsA = activeLayer[block] !== 'B';
+  const showEl = activeIsA ? b : a, hideEl = activeIsA ? a : b;
+  showEl.onload = () => { showEl.style.opacity = 1; hideEl.style.opacity = 0; };
+  showEl.src = src;
+  activeLayer[block] = activeIsA ? 'B' : 'A';
+}
+function renderImagesInstant(){
+  if(!state || !state.images) return;
+  for(const key in state.images){
+    const info = state.images[key];
+    if(!info) continue;
+    const block = +key;
+    const src = info.data || info.url;
+    if(!src) continue;
+    const round = info.round ?? 0;
+    if(lastShownRound[block] !== undefined && round <= lastShownRound[block]) continue;
+    setImageInstant(block, src);
+    lastShownRound[block] = round;
+  }
+}
+
+/* ---------------- story rendering ---------------- */
+function fullRenderStory(){
+  const container = $('#story');
+  container.innerHTML = '';
+  const paras = (state && state.paragraphs) || [];
+  for(let i=0;i<paras.length;i++){
+    const wrap = document.createElement('div');
+    wrap.className = 'para' + (i === liveIndex ? ' live' : '');
+    wrap.id = 'p-' + i;
+    wrap.innerHTML =
+      `<div class="illus" id="illus-${i}">` +
+        `<img class="layerA" id="imgA-${i}">` +
+        `<img class="layerB" id="imgB-${i}">` +
+      `</div>` +
+      `<div class="text" id="text-${i}"></div>`;
+    container.appendChild(wrap);
+    const textEl = wrap.querySelector('.text');
+    textEl.innerHTML = (i === liveIndex && frameTokens[i] && frameTokens[i].length)
+      ? tokensHTML(i)
+      : paragraphHTML(i);
+  }
+  renderImagesInstant();
+  renderQueue();
+}
+function updateLiveFrame(block){
+  const textEl = document.getElementById('text-' + block);
+  if(!textEl) return; // paragraph not in the DOM yet — frame is droppable, just skip it
+  textEl.innerHTML = tokensHTML(block);
+}
+function renderQueue(){
+  $('#queue').textContent = `${queueDepth} phrase${queueDepth === 1 ? '' : 's'} waiting to be woven`;
+}
+function renderRoundBadge(){
+  if(state && typeof state.round === 'number') $('#roundBadge').textContent = 'round ' + state.round;
+}
+
+/* ---------------- toast / low-key flashes ---------------- */
+let toastTimer = null;
+function flash(msg, cls){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'show' + (cls ? ' ' + cls : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=> t.className = '', 2600);
+}
+
+/* ---------------- "now weaving" theatre strip (round_start) ---------------- */
+function showNowWeaving(ev){
+  const el = $('#nowWeaving');
+  const subs = ev.submissions || [];
+  if(!subs.length){ el.textContent = `round ${ev.round} — reweaving…`; return; }
+  el.innerHTML = `round ${ev.round} — weaving in: ` + subs.map(s => {
+    const colour = s.colour || contributorColours[s.id || s.contributor] || '#888';
+    const text = esc(s.text || '');
+    return `<span class="dot2" style="background:${colour}"></span>"${text}"`;
+  }).join('  ');
+}
+
+/* ---------------- full snapshot application (state / round_end.state / split.state) ---------------- */
+function applyFullState(s){
+  state = s || {paragraphs: []};
+  liveIndex = (typeof state.live === 'number') ? state.live : liveIndex;
+  mergeContributors(state.contributors);
+  queueDepth = Array.isArray(state.pending) ? state.pending.length : queueDepth;
+  renderRoundBadge();
+  fullRenderStory();
+}
+
+/* ---------------- SSE wiring ---------------- */
+let es = null;
+
+function connect(){
+  es = new EventSource(`${API}/stream`);
+
+  es.addEventListener('open', () => { $('#dot').className = 'dot ok'; });
+
+  es.addEventListener('state', e => {
+    applyFullState(JSON.parse(e.data));
+  });
+
+  es.addEventListener('queue', e => {
+    const ev = JSON.parse(e.data);
+    queueDepth = (typeof ev.depth === 'number') ? ev.depth : (Array.isArray(ev.pending) ? ev.pending.length : queueDepth);
+    if(state && Array.isArray(ev.pending)) state.pending = ev.pending;
+    renderQueue();
+  });
+
+  es.addEventListener('round_start', e => {
+    const ev = JSON.parse(e.data);
+    liveIndex = (typeof ev.block === 'number') ? ev.block : liveIndex;
+    frameTokens[ev.block] = []; frameAge[ev.block] = [];
+    mergeSubmissionColours(ev.submissions);
+    if(Array.isArray(ev.pins)) pinsByBlock[ev.block] = ev.pins;
+    if(state && typeof ev.round === 'number') state.round = ev.round;
+    renderRoundBadge();
+    showNowWeaving(ev);
+    fullRenderStory();
+  });
+
+  es.addEventListener('pins', e => {
+    const ev = JSON.parse(e.data);
+    pinsByBlock[ev.block] = ev.spans || [];
+    if(ev.block === liveIndex){
+      if(!frameTokens[ev.block] || !frameTokens[ev.block].length){
+        const textEl = document.getElementById('text-' + ev.block);
+        if(textEl){
+          const baseText = (state && state.paragraphs && state.paragraphs[ev.block]) || '';
+          textEl.innerHTML = renderTextWithSpans(baseText, ev.spans, contributorColours);
+        }
+      } else {
+        updateLiveFrame(ev.block);
+      }
+    }
+  });
+
+  es.addEventListener('frame', e => {
+    const ev = JSON.parse(e.data);
+    const {block, tokens} = ev;
+    if(!Array.isArray(tokens)) return; // droppable — malformed/behind, just skip
+    const prev = frameTokens[block];
+    let ages;
+    if(!prev || prev.length !== tokens.length){
+      ages = new Array(tokens.length).fill(0);
+    } else {
+      ages = (frameAge[block] || []).slice();
+      for(let i=0;i<tokens.length;i++){
+        ages[i] = (tokens[i] === prev[i]) ? Math.min((ages[i] || 0) + 1, 9) : 0;
+      }
+    }
+    frameTokens[block] = tokens;
+    frameAge[block] = ages;
+    if(block !== liveIndex){
+      liveIndex = block;   // defensive: keep the "live" highlight on whichever block is actually animating
+      fullRenderStory();
+    } else {
+      updateLiveFrame(block);
+    }
+  });
+
+  es.addEventListener('commit', e => {
+    const ev = JSON.parse(e.data);
+    if(!state) state = {paragraphs: []};
+    state.paragraphs[ev.block] = ev.text; // authoritative text — never assembled from frames
+    blockSpansCache[ev.block] = ev.spans || [];
+    delete frameTokens[ev.block]; delete frameAge[ev.block];
+    fullRenderStory();
+  });
+
+  es.addEventListener('image', e => {
+    const ev = JSON.parse(e.data);
+    const block = ev.block, round = ev.round ?? 0;
+    const src = ev.data || ev.url;
+    if(!src) return;
+    if(lastShownRound[block] !== undefined && round <= lastShownRound[block]) return; // stale, drop
+    if(!document.getElementById('p-' + block)) return; // paragraph not rendered (yet) — skip
+    crossfadeImage(block, src);
+    lastShownRound[block] = round;
+    if(state){
+      state.images = state.images || {};
+      state.images[block] = {round, data: src};
+    }
+  });
+
+  es.addEventListener('round_rejected', e => {
+    const ev = JSON.parse(e.data);
+    flash(`round rejected — ${ev.reason || 'unspecified reason'}`, 'reject');
+    // story unchanged, deliberately no re-render here
+  });
+
+  es.addEventListener('split', e => {
+    const ev = JSON.parse(e.data);
+    const s = ev.state || {paragraphs: ev.paragraphs, live: ev.live,
+      contributors: state && state.contributors, pending: state && state.pending,
+      images: state && state.images, max_per_round: state && state.max_per_round, round: state && state.round};
+    // paragraph indices may have shifted — any cached per-block info is now unsafe to reuse
+    for(const k in blockSpansCache) delete blockSpansCache[k];
+    for(const k in pinsByBlock) delete pinsByBlock[k];
+    for(const k in frameTokens) delete frameTokens[k];
+    for(const k in frameAge) delete frameAge[k];
+    applyFullState(s);
+  });
+
+  es.addEventListener('round_end', e => {
+    const ev = JSON.parse(e.data);
+    if(ev.state) applyFullState(ev.state);
+  });
+
+  // NOTE: the server sends a *named* SSE event literally called `error` ({message}), which shares
+  // the event type "error" with the browser's own connection-failure event on EventSource. We tell
+  // them apart by payload: the server's version arrives as a MessageEvent with a `.data` string;
+  // a real connection drop arrives as a plain Event with no `.data`.
+  es.addEventListener('error', e => {
+    if(e && typeof e.data === 'string'){
+      let ev = null;
+      try{ ev = JSON.parse(e.data); }catch{}
+      flash(`hiccup — ${(ev && ev.message) || 'transient error'}`);
+      return; // item 9: story unchanged, keep listening on the same connection
+    }
+    // item 12: real connection drop — reconnect and do a full re-render from the next `state` event
+    $('#dot').className = 'dot bad';
+    if(es) es.close();
+    for(const k in blockSpansCache) delete blockSpansCache[k];
+    for(const k in pinsByBlock) delete pinsByBlock[k];
+    for(const k in frameTokens) delete frameTokens[k];
+    for(const k in frameAge) delete frameAge[k];
+    for(const k in lastShownRound) delete lastShownRound[k];
+    for(const k in activeLayer) delete activeLayer[k];
+    setTimeout(connect, 1000);
+  });
+}
+connect();
+
+/* ---------------- time-lapse close (item 11) ---------------- */
+let timelapseTimer = null;
+async function startTimelapse(){
+  if(timelapseTimer) return;
+  const overlay = $('#timelapse');
+  overlay.classList.add('show');
+  $('#tlLabel').textContent = 'loading…';
+  $('#tlBody').textContent = '';
+  let revisions = [];
+  try{
+    const res = await fetch(`${API}/history`);
+    const j = await res.json();
+    revisions = j.revisions || [];
+  }catch(err){
+    $('#tlLabel').textContent = 'history unavailable';
+    setTimeout(stopTimelapse, 1800);
+    return;
+  }
+  if(!revisions.length){
+    $('#tlLabel').textContent = 'no history yet';
+    setTimeout(stopTimelapse, 1800);
+    return;
+  }
+  let i = 0, showingAfter = false;
+  const step = () => {
+    const rev = revisions[i];
+    $('#tlLabel').textContent = `#${rev.n} · paragraph ${rev.block} · ${rev.kind}` + (showingAfter ? ' — after' : ' — before');
+    $('#tlBody').textContent = showingAfter ? rev.after : rev.before;
+    if(showingAfter){
+      i++; showingAfter = false;
+      if(i >= revisions.length){ setTimeout(stopTimelapse, 1600); return; }
+    } else {
+      showingAfter = true;
+    }
+  };
+  step();
+  timelapseTimer = setInterval(step, 1600);
+}
+function stopTimelapse(){
+  if(timelapseTimer){ clearInterval(timelapseTimer); timelapseTimer = null; }
+  $('#timelapse').classList.remove('show');
+}
+window.addEventListener('keydown', e => {
+  if(e.key === 't' || e.key === 'T') startTimelapse();
+  else if(e.key === 'Escape') stopTimelapse();
+});
+</script>
+</body>
+</html>

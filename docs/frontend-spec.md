@@ -87,10 +87,16 @@ above.
 9. **Recover from a transient backend error**: on `error`, the story is unchanged and any in-flight
    phrases were already requeued server-side — show the message briefly, keep listening on the same
    stream.
-10. **Time-lapse close**: a way to trigger (e.g. a key press for the human running the projector) a
+10. **Show the illustrated world**: render the latest generated still (per paragraph `block`) alongside
+    the text, and **crossfade** to a new one over ~400ms when an `image` event arrives — don't hard-cut.
+    This is a companion visual, not a video feed: a new still lands roughly once per committed round
+    (~6–15 sec later, after the round's `commit`), not continuously. If an `image` event's `round` is
+    older than the one already shown for that `block`, drop it — a slow generation can be overtaken by a
+    newer round before it arrives.
+11. **Time-lapse close**: a way to trigger (e.g. a key press for the human running the projector) a
     scrub through `GET /history`, replaying `before → after` per round as the demo's closing beat
     ("written by everyone in this room and no one").
-11. If the SSE connection drops, reconnect and re-render from the fresh `state` event the reconnect
+12. If the SSE connection drops, reconnect and re-render from the fresh `state` event the reconnect
     delivers — don't try to resume mid-stream.
 
 ### Endpoints
@@ -105,6 +111,7 @@ above.
 | `pins` | `block`, `spans[]` | colour submitted spans from step 0, before frames arrive |
 | `frame` | `block`, `step`, `total`, `tokens[]` | live denoise animation (droppable — skip if behind, never block on it) |
 | `commit` | `round`, `block`, `text`, `spans`, `kind` | authoritative paragraph text — the only source of truth for displayed story |
+| `image` | `round`, `block`, `url` (or `data`, a data URI) | a new illustration for that paragraph, generated from the committed text — droppable, crossfade in, ignore if older than the `round` already shown for that `block` |
 | `round_rejected` | `round`, `block`, `reason` | brief, low-key rejection indicator |
 | `split` | `live`, `paragraphs`, `state` | full re-render, paragraph indices may have moved |
 | `round_end` | `round`, `state` | general resync point after a round finishes |
@@ -121,8 +128,13 @@ health/status widget that doesn't want a persistent connection.
   "busy": true,
   "pending": [ {"text": "...", "contributor": "8f2c...", "at": 1.7e9, "target": null} ],
   "contributors": { "8f2c...": {"id": "...", "name": "Ada", "colour": "#f07178"} },
-  "max_per_round": 2 }
+  "max_per_round": 2,
+  "images": { "0": {"round": 12, "url": "..."}, "2": {"round": 17, "url": "..."} } }
 ```
+
+`images` is keyed by paragraph `block` and holds only the latest still per block — this is what lets a
+client that connects mid-stream (or reconnects) show the current illustrations immediately instead of
+waiting for the next round's `image` event. A block with no entry yet just shows nothing/a placeholder.
 
 **`GET /history`** — for the time-lapse close.
 
@@ -149,3 +161,7 @@ a small "the loom is alive" indicator; not required for core functionality.
 - **Nothing is persisted server-side** — a backend restart loses the story and history. Don't design a
   UX that assumes the story survives a refresh of the *server*, only of the client.
 - **Contributor colour is always server-assigned** — never generate or override it client-side.
+- **Illustrations are a still-image companion, not video** — Nano Banana (Gemini 3.7 Flash) is a hosted
+  call with real per-image latency and cost, triggered once per committed round rather than continuously.
+  Don't build a UI that implies a live camera-like feed; a crossfade between stills is the right amount
+  of motion.
